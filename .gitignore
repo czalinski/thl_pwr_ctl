@@ -1,0 +1,23 @@
+# Build output
+build/
+*.uf2
+*.elf
+*.bin
+*.map
+*.lst
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+
+# VS Code
+.vscode/
+
+# Arduino IDE
+*.bak
+
+# OS
+.DS_Store
+Thumbs.db
