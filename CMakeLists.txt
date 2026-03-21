@@ -109,6 +109,7 @@ target_link_libraries(self_test
     ssd1306
     pico_stdlib
     hardware_i2c
+    hardware_uart
 )
 pico_enable_stdio_usb(self_test 1)
 pico_enable_stdio_uart(self_test 0)

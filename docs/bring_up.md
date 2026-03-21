@@ -82,11 +82,12 @@ Once the board is powered over USB the OLED shows a results screen within
 ```
     THL PWR CTL
       Self Test
-
 OLED:    PASS
 EEPROM:  NONE
 RS485-H: NONE
 RS485-S: NONE
+RS232-H: NONE
+RS232-S: NONE
 ```
 
 The display refreshes every 5 seconds to confirm the board is still running.
@@ -174,11 +175,12 @@ the RS-485 transceivers are not yet fitted so those rows show `NONE`:
 ```
     THL PWR CTL
       Self Test
-
 OLED:    PASS
 EEPROM:  PASS
 RS485-H: NONE
 RS485-S: NONE
+RS232-H: NONE
+RS232-S: NONE
 ```
 
 USB serial output shows each EEPROM write/read-back cycle:
@@ -279,11 +281,12 @@ cmake --build build --target self_test
 ```
     THL PWR CTL
       Self Test
-
 OLED:    PASS
 EEPROM:  PASS
 RS485-H: PASS
 RS485-S: PASS
+RS232-H: NONE
+RS232-S: NONE
 ```
 
 USB serial shows each byte of the loopback sequence for both channels:
@@ -321,6 +324,138 @@ USB serial shows each byte of the loopback sequence for both channels:
 - [ ] No hot components, no smell of burning.
 
 **Do not proceed to Stage 4 until all Stage 3 pass criteria are met.**
+
+---
+
+---
+
+## Stage 4 — RS-232 Transceivers
+
+Both RS-232 channels use the **ST3232BDR** signal conditioner, which converts
+3.3 V UART logic to ±RS-232 levels and back. An external charge-pump capacitor
+network is required for operation. UART0 (hardware, GP0/GP1) and UART2
+(software bit-bang, GP6/GP7) each have their own DSUB-9 connector.
+
+The loopback test uses a **null modem cable** (TX↔RX crossed) connecting the
+two DSUB connectors together. This exercises the complete signal chain for both
+channels in two independent phases:
+
+- **RS232-H (Phase H):** UART0 HW sends → ST3232 → DSUB-0 → null modem →
+  DSUB-2 → ST3232 → GP7 (UART2 SW receives). Tests UART0 TX and UART2 RX.
+- **RS232-S (Phase S):** GP6 (UART2 SW sends) → ST3232 → DSUB-2 → null modem →
+  DSUB-0 → ST3232 → UART0 HW receives. Tests UART2 TX and UART0 RX.
+
+Unlike the RS-485 self-loopback (where RO mirrors DI in real time), the RS-232
+loopback travels through an external cable so TX and RX arrive on different GPIO
+pins. A standard bit-bang receiver is used for UART2: detect the falling edge of
+the start bit, wait 1.5 bit periods to the midpoint of bit 0, then sample every
+bit period for 8 data bits.
+
+### Components to solder
+
+| Ref | Component | Notes |
+|-----|-----------|-------|
+| U?  | ST3232BDR — UART0 channel | GP0 TX → T1IN, R1OUT → GP1 RX |
+| U?  | ST3232BDR — UART2 channel | GP6 TX → T1IN, R1OUT → GP7 RX |
+| C?  | Charge-pump capacitors ×8 | 4 per ST3232BDR; values per datasheet (typically 100 nF) |
+| J?  | DSUB-9 connector — UART0  | Pin 2 = RX (R1OUT), Pin 3 = TX (T1IN) |
+| J?  | DSUB-9 connector — UART2  | Pin 2 = RX (R1OUT), Pin 3 = TX (T1IN) |
+
+### Before soldering — visual checks
+
+1. Confirm Stage 3 pass criteria were met before proceeding.
+2. Inspect ST3232BDR footprints and verify pin 1 orientation.
+3. Verify DSUB connector footprints — confirm pin 2 (RX) and pin 3 (TX)
+   are routed to the correct ST3232BDR receiver output and driver input.
+4. Confirm all four charge-pump capacitor footprints are present per IC.
+
+### Soldering
+
+1. Solder **charge-pump capacitors** first (smallest components).
+2. Solder both **ST3232BDR** ICs. Tack, verify alignment, complete, inspect
+   for bridges.
+3. Solder both **DSUB-9 connectors**. These have mechanical mounting pins —
+   solder those too for mechanical strength.
+
+### Post-solder checks — before applying power
+
+1. **Power:** No short between VCC and GND on either IC.
+2. **Charge-pump caps:** Confirm all capacitors are fitted and correctly
+   oriented (if polarised).
+3. **DSUB pin 2 / pin 3:** Confirm pin 2 routes to R1OUT and pin 3 to T1IN
+   on each ST3232BDR with the multimeter in continuity mode.
+
+### Null modem cable wiring
+
+A standard null modem cable crosses the TX and RX lines:
+
+| DSUB-0 pin | Signal | DSUB-2 pin |
+|------------|--------|------------|
+| 2 (RX)     | ←→     | 3 (TX)     |
+| 3 (TX)     | ←→     | 2 (RX)     |
+| 5 (GND)    | ←→     | 5 (GND)    |
+
+Handshaking lines (RTS/CTS/DTR/DSR) are not used by the firmware test and
+do not need to be connected.
+
+### Firmware
+
+Re-flash `self_test.uf2` — this stage requires the firmware built after
+Stage 4 was added.
+
+```bash
+cmake --build build --target self_test
+# Copy build/self_test.uf2 to the Pico via BOOTSEL
+# Connect the null modem cable between the two DSUB connectors before power-up
+```
+
+### Expected behaviour
+
+```
+    THL PWR CTL
+      Self Test
+OLED:    PASS
+EEPROM:  PASS
+RS485-H: PASS
+RS485-S: PASS
+RS232-H: PASS
+RS232-S: PASS
+```
+
+USB serial shows both phases:
+
+```
+[SELF-TEST] RS232-H: sent 0x52  recv 0x52  OK
+[SELF-TEST] RS232-H: sent 0x53  recv 0x53  OK
+[SELF-TEST] RS232-H: sent 0x32  recv 0x32  OK
+[SELF-TEST] RS232-H: sent 0x33  recv 0x33  OK
+[SELF-TEST] RS232-H: sent 0x32  recv 0x32  OK
+[SELF-TEST] RS232-H: PASS
+[SELF-TEST] RS232-S: sent 0x52  recv 0x52  OK
+[SELF-TEST] RS232-S: sent 0x53  recv 0x53  OK
+[SELF-TEST] RS232-S: sent 0x32  recv 0x32  OK
+[SELF-TEST] RS232-S: sent 0x33  recv 0x33  OK
+[SELF-TEST] RS232-S: sent 0x32  recv 0x32  OK
+[SELF-TEST] RS232-S: PASS
+```
+
+### Fault diagnosis
+
+| Symptom | Likely cause | Action |
+|---------|--------------|--------|
+| `RS232-H: NONE` | Phase H open — no data reaches GP7 | Check null modem cable is connected; confirm DSUB-0 pin 3 routes to ST3232 T1IN and DSUB-2 pin 2 routes to ST3232 R1OUT |
+| `RS232-S: NONE` | Phase S open — no data reaches UART0 RX | Check DSUB-2 pin 3 routes to ST3232 T1IN and DSUB-0 pin 2 routes to ST3232 R1OUT |
+| Either `FAIL` | Data mismatch | Verify ±RS-232 voltage on DSUB pins with multimeter while running (expect ±5 V to ±9 V); inspect charge-pump cap values and joints |
+| Either `FAIL` | Inverted data | TX and RX swapped on one DSUB connector; swap pin 2/3 wiring on that connector |
+| ST3232BDR warm to touch | Charge-pump cap short or wrong value | Remove power; check capacitor values against datasheet |
+
+### Stage 4 pass criteria
+
+- [ ] OLED shows `RS232-H: PASS` and `RS232-S: PASS`.
+- [ ] USB serial shows all five bytes `OK` for both phases.
+- [ ] No hot components, no smell of burning.
+
+**Do not proceed to Stage 5 until all Stage 4 pass criteria are met.**
 
 ---
 
