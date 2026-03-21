@@ -129,8 +129,7 @@ target_include_directories(thl_pwr_ctl PRIVATE
 target_link_libraries(thl_pwr_ctl
     pico_stdlib
     hardware_spi
-    hardware_flash
-    hardware_sync
+    hardware_i2c
     hardware_watchdog
     ioLibrary_Ethernet
 )

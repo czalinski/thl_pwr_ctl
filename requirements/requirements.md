@@ -82,11 +82,11 @@ must use these mappings — do not reassign pins without a hardware revision.
 > Supported browsers must receive a valid HTML response with no JavaScript required
 > for the configuration form to function.
 
-### REQ-003 — Persistent Configuration Storage in Flash
-> Modified settings shall be written to a dedicated area of the flash memory chip
-> accessible to the controller. The stored settings shall be validated on every boot via
-> a CRC-32 checksum. If the stored config is absent or corrupt the device shall
-> automatically fall back to factory defaults (REQ-001) without operator intervention.
+### REQ-003 — Persistent Configuration Storage in EEPROM
+> Modified settings shall be written to the onboard **W24C02 EEPROM** (I2C1, address 0x50,
+> GP2/GP3). The stored settings shall be validated on every boot via a CRC-32 checksum.
+> If the stored config is absent or corrupt the device shall automatically fall back to
+> factory defaults (REQ-001) without operator intervention.
 
 ### REQ-004 — Factory Reset via Web Interface
 > The web configuration page shall include a **Factory Reset** action. Activating it
@@ -125,3 +125,4 @@ must use these mappings — do not reassign pins without a hardware revision.
 | 2026-03-20 | 0.5 | Add GPIO pin mapping table; fix REQ-TEST-001 OLED I2C pins to GP2/GP3 (I2C1) |
 | 2026-03-20 | 0.6 | Add I2C device map: SSD1306 on I2C1, MCP3428 ×2 on I2C0 (0x36, 0x37) |
 | 2026-03-20 | 0.7 | Add I2C1 devices: W24C02 EEPROM (0x50), TCA9555PWR GPIO expander (0x20) |
+| 2026-03-20 | 0.8 | REQ-003: migrate config storage from Pico flash to W24C02 EEPROM |

@@ -2,11 +2,57 @@
 
 #include <string.h>
 #include "pico/stdlib.h"
-#include "hardware/flash.h"
-#include "hardware/sync.h"
+#include "hardware/i2c.h"
+#include "hardware/gpio.h"
 
-/* Read-only pointer into XIP-mapped flash where the config sector lives */
-#define CONFIG_XIP_PTR  ((const device_config_t *)(XIP_BASE + CONFIG_FLASH_OFFSET))
+/* ---------------------------------------------------------------------------
+ * W24C02 EEPROM — I2C1, address 0x50, GP2 SDA / GP3 SCL (PCB pin mapping)
+ * --------------------------------------------------------------------------- */
+#define EEPROM_ADDR      0x50
+#define EEPROM_I2C       i2c1
+#define EEPROM_SDA       2
+#define EEPROM_SCL       3
+#define EEPROM_BAUD      400000u
+#define EEPROM_PAGE_SIZE 16          /* W24C02 page write boundary */
+#define EEPROM_WR_MS     5           /* max write cycle time per page */
+
+static bool i2c_ready = false;
+
+static void eeprom_init(void)
+{
+    if (i2c_ready) return;
+    i2c_init(EEPROM_I2C, EEPROM_BAUD);
+    gpio_set_function(EEPROM_SDA, GPIO_FUNC_I2C);
+    gpio_set_function(EEPROM_SCL, GPIO_FUNC_I2C);
+    gpio_pull_up(EEPROM_SDA);
+    gpio_pull_up(EEPROM_SCL);
+    i2c_ready = true;
+}
+
+static void eeprom_read(uint8_t addr, uint8_t *data, size_t len)
+{
+    i2c_write_blocking(EEPROM_I2C, EEPROM_ADDR, &addr, 1, true);
+    i2c_read_blocking(EEPROM_I2C, EEPROM_ADDR, data, len, false);
+}
+
+static void eeprom_write(uint8_t addr, const uint8_t *data, size_t len)
+{
+    while (len > 0) {
+        /* Respect 16-byte page boundaries */
+        uint8_t page_rem = EEPROM_PAGE_SIZE - (addr % EEPROM_PAGE_SIZE);
+        size_t chunk = len < page_rem ? len : page_rem;
+
+        uint8_t buf[EEPROM_PAGE_SIZE + 1];
+        buf[0] = addr;
+        memcpy(buf + 1, data, chunk);
+        i2c_write_blocking(EEPROM_I2C, EEPROM_ADDR, buf, chunk + 1, false);
+        sleep_ms(EEPROM_WR_MS);
+
+        addr += (uint8_t)chunk;
+        data += chunk;
+        len  -= chunk;
+    }
+}
 
 /* ---------------------------------------------------------------------------
  * CRC-32 (standard polynomial 0xEDB88320, little-endian bit order)
@@ -24,7 +70,6 @@ static uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len)
 
 uint32_t config_crc32(const device_config_t *cfg)
 {
-    /* Cover everything except the trailing crc32 field */
     return crc32_update(0, (const uint8_t *)cfg,
                         sizeof(device_config_t) - sizeof(uint32_t));
 }
@@ -53,36 +98,26 @@ void config_factory_defaults(device_config_t *cfg)
 }
 
 /* ---------------------------------------------------------------------------
- * Load
+ * Load / Save
  * --------------------------------------------------------------------------- */
 void config_load(device_config_t *cfg)
 {
-    const device_config_t *f = CONFIG_XIP_PTR;
+    eeprom_init();
 
-    if (f->magic == CONFIG_MAGIC && f->crc32 == config_crc32(f)) {
-        memcpy(cfg, f, sizeof(device_config_t));
+    device_config_t tmp;
+    eeprom_read(0, (uint8_t *)&tmp, sizeof(tmp));
+
+    if (tmp.magic == CONFIG_MAGIC && tmp.crc32 == config_crc32(&tmp)) {
+        *cfg = tmp;
     } else {
         config_factory_defaults(cfg);
     }
 }
 
-/* ---------------------------------------------------------------------------
- * Save — must execute from RAM while flash is being written
- * --------------------------------------------------------------------------- */
-static void __no_inline_not_in_flash_func(do_flash_write)(const uint8_t *data,
-                                                           size_t len)
-{
-    uint32_t irq = save_and_disable_interrupts();
-    flash_range_erase(CONFIG_FLASH_OFFSET, FLASH_SECTOR_SIZE);
-    flash_range_program(CONFIG_FLASH_OFFSET, data, len);
-    restore_interrupts(irq);
-}
-
 void config_save(const device_config_t *cfg)
 {
-    device_config_t tmp;
-    memcpy(&tmp, cfg, sizeof(tmp));
+    device_config_t tmp = *cfg;
     tmp.magic = CONFIG_MAGIC;
     tmp.crc32 = config_crc32(&tmp);
-    do_flash_write((const uint8_t *)&tmp, sizeof(tmp));
+    eeprom_write(0, (uint8_t *)&tmp, sizeof(tmp));
 }
