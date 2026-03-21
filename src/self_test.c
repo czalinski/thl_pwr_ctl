@@ -10,16 +10,14 @@
  * Stage 4 — RS-485 SW UART3 loop  (ISL83488IBZ, GP14 TX / GP15 RX)
  * Stage 5 — RS-232 HW UART0 loop  (ST3232BDR,   GP0  TX / GP1  RX)
  * Stage 6 — RS-232 SW UART2 loop  (ST3232BDR,   GP6  TX / GP7  RX)
+ * Stage 7 — GPIO expander P0 I/O  (TCA9555PWR,  I2C1 0x20, GP2/GP3)
  *
- * Display layout (8 pages × 128 px, no blank separator):
- *   Page 0  "THL PWR CTL"    centred title
- *   Page 1  "Self Test"      centred subtitle
- *   Page 2  "OLED:    PASS/FAIL"
- *   Page 3  "EEPROM:  PASS/FAIL/NONE"
- *   Page 4  "RS485-H: PASS/FAIL/NONE"
- *   Page 5  "RS485-S: PASS/FAIL/NONE"
- *   Page 6  "RS232-H: PASS/FAIL/NONE"
- *   Page 7  "RS232-S: PASS/FAIL/NONE"
+ * ---- Display layout ----
+ * The display has 8 pages (rows). Page 0 is always the title "THL PWR CTL";
+ * pages 1–7 show up to 7 test results. When there are more than 7 results
+ * the loop alternates between screens every 5 seconds, each showing the
+ * next 7 results (with the title repeated). This scales to any number of
+ * future stages without changing the display logic.
  *
  * ---- RS-485 loopback design note ----
  * The ISL83488IBZ is a full-duplex RS-485 transceiver with DE tied HIGH and
@@ -34,8 +32,8 @@
  *
  * Software UART3 (stage 4): exploits the near-zero loopback propagation of
  * the ISL83488IBZ — each bit is driven on GP14 and GP15 is sampled at the
- * midpoint of the same bit. This tests the full signal chain at 9600 baud
- * without needing interrupts, PIO, or concurrent TX/RX threads.
+ * midpoint of the same bit period. This tests the full signal chain at 9600
+ * baud without needing interrupts, PIO, or concurrent TX/RX threads.
  *
  * ---- RS-232 loopback design note ----
  * The ST3232BDR converts 3.3 V logic to ±RS-232 levels and back. Two DSUB
@@ -51,12 +49,9 @@
  *
  * RS232-H reports the Phase H result (UART0 TX + UART2 RX path).
  * RS232-S reports the Phase S result (UART2 TX + UART0 RX path).
- * Both must pass for the full RS-232 signal chain to be verified.
  *
- * RESULT_NONE — no response received; transceiver/connector/cable not fitted
- *               or not connected.
- * RESULT_FAIL — response received but data mismatch; signal integrity or
- *               wiring fault.
+ * RESULT_NONE — no response received; component not fitted or not connected.
+ * RESULT_FAIL — response received but data mismatch; signal or wiring fault.
  */
 
 #include <stdio.h>
@@ -96,11 +91,22 @@
 #define RS232_HW_RX_TIMEOUT_US  20000
 
 /* RS-232 software UART2 (GP6 TX, GP7 RX) */
-#define RS232_SW_TX_PIN      6
-#define RS232_SW_RX_PIN      7
-#define RS232_BIT_US         104
-#define RS232_HALF_US        52
-#define RS232_SW_RX_TIMEOUT_US  50000   /* 50 ms: generous for cable round-trip */
+#define RS232_SW_TX_PIN         6
+#define RS232_SW_RX_PIN         7
+#define RS232_BIT_US            104
+#define RS232_HALF_US           52
+#define RS232_SW_RX_TIMEOUT_US  50000
+
+/* TCA9555PWR GPIO expander (I2C1, address 0x20) */
+#define TCA9555_ADDR     0x20
+#define TCA9555_IN0      0x00   /* input  port 0 register */
+#define TCA9555_OUT0     0x02   /* output port 0 register */
+#define TCA9555_CFG0     0x06   /* config port 0 register (1=input, 0=output) */
+#define TCA9555_CFG1     0x07   /* config port 1 register */
+/* P00–P03 outputs (0), P04–P07 inputs (1) → 0xF0 */
+#define TCA9555_P0_CFG   0xF0
+/* P10–P17 relay outputs — configure as inputs for safety during P0 test */
+#define TCA9555_P1_CFG_SAFE  0xFF
 
 /* Test payload shared by all serial loopback tests */
 static const uint8_t SERIAL_TEST_MSG[] = { 'R', 'S', '2', '3', '2' };
@@ -109,8 +115,26 @@ static const uint8_t SERIAL_TEST_MSG[] = { 'R', 'S', '2', '3', '2' };
 typedef enum { RESULT_PASS, RESULT_FAIL, RESULT_NONE } result_t;
 
 /* ---------------------------------------------------------------------------
- * Display
+ * Result store and display
+ *
+ * Results are accumulated in order of testing. The display loop shows up to
+ * 7 results per screen (pages 1–7, with the title on page 0) and alternates
+ * between screens when there are more than 7 results.
  * --------------------------------------------------------------------------- */
+#define MAX_RESULTS 16
+
+static const char *result_label[MAX_RESULTS];
+static result_t    result_value[MAX_RESULTS];
+static int         result_count = 0;
+
+static void record_result(const char *label, result_t r)
+{
+    if (result_count < MAX_RESULTS) {
+        result_label[result_count] = label;
+        result_value[result_count] = r;
+        result_count++;
+    }
+}
 
 static uint8_t center_col(const char *s)
 {
@@ -118,40 +142,27 @@ static uint8_t center_col(const char *s)
     return (uint8_t)(px >= SSD1306_WIDTH ? 0 : (SSD1306_WIDTH - px) / 2);
 }
 
-static void draw_results(result_t oled,    result_t eeprom,
-                         result_t rs485_hw, result_t rs485_sw,
-                         result_t rs232_hw, result_t rs232_sw)
+/** Draw one screen of up to 7 results starting at result index 'first'. */
+static void draw_screen(int first)
 {
     static const char *tag[] = { "PASS", "FAIL", "NONE" };
     char line[22];
 
     ssd1306_clear();
     ssd1306_draw_string(center_col("THL PWR CTL"), 0, "THL PWR CTL");
-    ssd1306_draw_string(center_col("Self Test"),   1, "Self Test");
 
-    snprintf(line, sizeof(line), "OLED:    %s", tag[oled]);
-    ssd1306_draw_string(4, 2, line);
-
-    snprintf(line, sizeof(line), "EEPROM:  %s", tag[eeprom]);
-    ssd1306_draw_string(4, 3, line);
-
-    snprintf(line, sizeof(line), "RS485-H: %s", tag[rs485_hw]);
-    ssd1306_draw_string(4, 4, line);
-
-    snprintf(line, sizeof(line), "RS485-S: %s", tag[rs485_sw]);
-    ssd1306_draw_string(4, 5, line);
-
-    snprintf(line, sizeof(line), "RS232-H: %s", tag[rs232_hw]);
-    ssd1306_draw_string(4, 6, line);
-
-    snprintf(line, sizeof(line), "RS232-S: %s", tag[rs232_sw]);
-    ssd1306_draw_string(4, 7, line);
-
+    for (int i = 0; i < 7 && (first + i) < result_count; i++) {
+        snprintf(line, sizeof(line), "%s%s",
+                 result_label[first + i],
+                 tag[result_value[first + i]]);
+        ssd1306_draw_string(4, 1 + i, line);
+    }
     ssd1306_flush();
 }
 
 /* ---------------------------------------------------------------------------
  * Stage 2 — EEPROM
+ * I2C1 is already initialised by ssd1306_init(); no re-init needed.
  * --------------------------------------------------------------------------- */
 static result_t test_eeprom(void)
 {
@@ -178,10 +189,8 @@ static result_t test_eeprom(void)
             printf("[SELF-TEST] EEPROM: read error (pattern 0x%02X)\n", patterns[i]);
             return RESULT_FAIL;
         }
-
         printf("[SELF-TEST] EEPROM: wrote 0x%02X  read 0x%02X  %s\n",
                patterns[i], rb, rb == patterns[i] ? "OK" : "MISMATCH");
-
         if (rb != patterns[i]) return RESULT_FAIL;
     }
     return RESULT_PASS;
@@ -190,9 +199,9 @@ static result_t test_eeprom(void)
 /* ---------------------------------------------------------------------------
  * Stage 3 — RS-485 hardware UART1 loopback
  *
- * UART1 TX (GP4) drives the ISL83488IBZ DI; the Y/Z outputs are wired to
- * A/B inputs so RO (GP5) mirrors DI with ~10 ns delay. The RP2040 hardware
- * UART manages TX and RX simultaneously on independent paths.
+ * UART1 TX (GP4) drives the ISL83488IBZ DI; Y/Z wired to A/B so RO (GP5)
+ * mirrors DI with ~10 ns delay. RP2040 hardware UART manages TX and RX
+ * simultaneously on independent paths.
  * --------------------------------------------------------------------------- */
 static result_t test_rs485_hw(void)
 {
@@ -228,8 +237,8 @@ static result_t test_rs485_hw(void)
  *
  * Exploits the near-zero ISL83488IBZ loopback propagation: each bit is
  * driven on GP14 and GP15 is sampled at the midpoint of the same bit period.
- * This tests the full TX→transceiver→cable→transceiver→RX signal chain at
- * 9600 baud without needing interrupts, PIO, or concurrent TX/RX threads.
+ * This tests the full signal chain without interrupts, PIO, or concurrent
+ * TX/RX threads.
  * --------------------------------------------------------------------------- */
 static result_t test_rs485_sw(void)
 {
@@ -240,7 +249,6 @@ static result_t test_rs485_sw(void)
     gpio_init(RS485_SW_RX_PIN);
     gpio_set_dir(RS485_SW_RX_PIN, GPIO_IN);
     gpio_pull_up(RS485_SW_RX_PIN);
-
     sleep_us(200);
 
     /* Probe: pull TX low and verify RX follows */
@@ -259,14 +267,12 @@ static result_t test_rs485_sw(void)
         uint8_t byte = SERIAL_TEST_MSG[m];
         bool byte_ok = true;
 
-        /* Start bit */
-        gpio_put(RS485_SW_TX_PIN, 0);
+        gpio_put(RS485_SW_TX_PIN, 0);          /* start bit */
         sleep_us(RS485_SW_HALF_US);
         if (gpio_get(RS485_SW_RX_PIN) != 0) byte_ok = false;
         sleep_us(RS485_SW_HALF_US);
 
-        /* 8 data bits, LSB first — drive bit, sample RX at midpoint */
-        for (int b = 0; b < 8; b++) {
+        for (int b = 0; b < 8; b++) {          /* 8 data bits, LSB first */
             uint8_t tx_bit = (byte >> b) & 1u;
             gpio_put(RS485_SW_TX_PIN, tx_bit);
             sleep_us(RS485_SW_HALF_US);
@@ -274,14 +280,12 @@ static result_t test_rs485_sw(void)
             sleep_us(RS485_SW_HALF_US);
         }
 
-        /* Stop bit */
-        gpio_put(RS485_SW_TX_PIN, 1);
+        gpio_put(RS485_SW_TX_PIN, 1);          /* stop bit */
         sleep_us(RS485_SW_BIT_US);
 
         printf("[SELF-TEST] RS485-S: byte 0x%02X ('%c')  %s\n",
                byte, (byte >= 0x20 && byte < 0x7F) ? (char)byte : '.',
                byte_ok ? "OK" : "MISMATCH");
-
         if (!byte_ok) return RESULT_FAIL;
     }
     return RESULT_PASS;
@@ -291,42 +295,37 @@ static result_t test_rs485_sw(void)
  * RS-232 software UART helpers (bit-bang TX and RX at 9600 baud)
  *
  * Unlike the RS-485 SW test, the RS-232 loopback travels through an external
- * null modem cable between two separate DSUB connectors, so TX and RX are on
- * different physical GPIO pins and cannot be sampled simultaneously.
- * A standard bit-bang receiver is used: detect the falling edge of the start
- * bit, wait 1.5 bit periods to reach the midpoint of bit 0, then sample every
- * bit period for 8 data bits.
+ * null modem cable between two separate DSUB connectors. TX and RX are on
+ * different physical GPIO pins and cannot be sampled simultaneously. A
+ * standard bit-bang receiver is therefore used: detect the falling edge of
+ * the start bit, wait 1.5 bit periods to the midpoint of bit 0, then sample
+ * every bit period for 8 data bits.
  * --------------------------------------------------------------------------- */
 static void sw_uart_send_byte(uint pin, uint8_t byte)
 {
-    gpio_put(pin, 0);           /* start bit */
+    gpio_put(pin, 0);                   /* start bit */
     sleep_us(RS232_BIT_US);
     for (int b = 0; b < 8; b++) {
         gpio_put(pin, (byte >> b) & 1u);
         sleep_us(RS232_BIT_US);
     }
-    gpio_put(pin, 1);           /* stop bit */
+    gpio_put(pin, 1);                   /* stop bit */
     sleep_us(RS232_BIT_US);
 }
 
 static bool sw_uart_recv_byte(uint pin, uint8_t *out, uint32_t timeout_us)
 {
-    /* Wait for falling edge of start bit */
     uint32_t deadline = time_us_32() + timeout_us;
-    while (gpio_get(pin) != 0) {
+    while (gpio_get(pin) != 0) {       /* wait for falling edge of start bit */
         if (time_us_32() > deadline) return false;
     }
-
-    /* Advance to the midpoint of bit 0: 1.5 × bit period from start of start bit */
+    /* Advance to midpoint of bit 0: 1.5 × bit period from start of start bit */
     sleep_us(RS232_BIT_US + RS232_HALF_US);
-
     uint8_t byte = 0;
     for (int b = 0; b < 8; b++) {
         byte |= ((uint8_t)gpio_get(pin) << b);
-        sleep_us(RS232_BIT_US);   /* advance to midpoint of next bit */
+        sleep_us(RS232_BIT_US);
     }
-    /* Now in the stop-bit region; no need to verify it for a basic loopback test */
-
     *out = byte;
     return true;
 }
@@ -334,28 +333,19 @@ static bool sw_uart_recv_byte(uint pin, uint8_t *out, uint32_t timeout_us)
 /* ---------------------------------------------------------------------------
  * Stages 5 & 6 — RS-232 loopback (ST3232BDR, null modem cable)
  *
- * Two-phase cross test:
- *   Phase H (RS232-H): UART0 HW sends → ST3232 → DSUB-0 → null modem →
- *                      DSUB-2 → ST3232 → GP7 (UART2 SW receives)
- *   Phase S (RS232-S): GP6 (UART2 SW sends) → ST3232 → DSUB-2 → null modem →
- *                      DSUB-0 → ST3232 → UART0 HW receives
- *
+ * Two-phase cross test — see file header for full description.
  * RS232-H covers the UART0 TX and UART2 RX paths.
  * RS232-S covers the UART2 TX and UART0 RX paths.
- * NONE is returned when no data arrives within the timeout (cable not
- * connected or transceiver not fitted). FAIL indicates a data mismatch.
  * --------------------------------------------------------------------------- */
 static void test_rs232(result_t *hw_out, result_t *sw_out)
 {
-    /* Initialise hardware UART0 */
     uart_init(RS232_HW_UART, RS232_BAUD);
     gpio_set_function(RS232_HW_TX_PIN, GPIO_FUNC_UART);
     gpio_set_function(RS232_HW_RX_PIN, GPIO_FUNC_UART);
 
-    /* Initialise software UART2 pins */
     gpio_init(RS232_SW_TX_PIN);
     gpio_set_dir(RS232_SW_TX_PIN, GPIO_OUT);
-    gpio_put(RS232_SW_TX_PIN, 1);    /* idle high */
+    gpio_put(RS232_SW_TX_PIN, 1);
 
     gpio_init(RS232_SW_RX_PIN);
     gpio_set_dir(RS232_SW_RX_PIN, GPIO_IN);
@@ -363,17 +353,14 @@ static void test_rs232(result_t *hw_out, result_t *sw_out)
 
     sleep_us(500);   /* allow ST3232BDR charge-pump to stabilise */
 
-    /* --- Phase H: UART0 HW sends, UART2 SW receives via bit-bang --- */
-    while (uart_is_readable(RS232_HW_UART))
-        uart_getc(RS232_HW_UART);   /* drain stale RX data */
-
+    /* Phase H: UART0 HW sends, UART2 SW receives */
+    while (uart_is_readable(RS232_HW_UART)) uart_getc(RS232_HW_UART);
     uart_write_blocking(RS232_HW_UART, SERIAL_TEST_MSG, SERIAL_TEST_LEN);
 
     result_t phase_h = RESULT_PASS;
     for (size_t i = 0; i < SERIAL_TEST_LEN; i++) {
         uint8_t rx = 0;
-        uint32_t tmo = (i == 0) ? RS232_SW_RX_TIMEOUT_US : RS232_SW_RX_TIMEOUT_US;
-        if (!sw_uart_recv_byte(RS232_SW_RX_PIN, &rx, tmo)) {
+        if (!sw_uart_recv_byte(RS232_SW_RX_PIN, &rx, RS232_SW_RX_TIMEOUT_US)) {
             printf("[SELF-TEST] RS232-H: timeout on byte %u — %s\n",
                    (unsigned)i, i == 0 ? "not fitted" : "FAIL");
             phase_h = (i == 0) ? RESULT_NONE : RESULT_FAIL;
@@ -386,16 +373,14 @@ static void test_rs232(result_t *hw_out, result_t *sw_out)
     }
     *hw_out = phase_h;
 
-    /* Brief gap between phases */
     sleep_ms(5);
-    while (uart_is_readable(RS232_HW_UART))
-        uart_getc(RS232_HW_UART);   /* drain anything from phase H */
+    while (uart_is_readable(RS232_HW_UART)) uart_getc(RS232_HW_UART);
 
-    /* --- Phase S: UART2 SW sends via bit-bang, UART0 HW receives --- */
-    result_t phase_s = RESULT_PASS;
+    /* Phase S: UART2 SW sends, UART0 HW receives */
     for (size_t i = 0; i < SERIAL_TEST_LEN; i++)
         sw_uart_send_byte(RS232_SW_TX_PIN, SERIAL_TEST_MSG[i]);
 
+    result_t phase_s = RESULT_PASS;
     for (size_t i = 0; i < SERIAL_TEST_LEN; i++) {
         uint32_t deadline = time_us_32() + RS232_HW_RX_TIMEOUT_US;
         while (!uart_is_readable(RS232_HW_UART)) {
@@ -417,6 +402,64 @@ phase_s_done:
 }
 
 /* ---------------------------------------------------------------------------
+ * Stage 7 — TCA9555PWR GPIO expander, port 0
+ *
+ * Port 0 configuration (register 0x06 = 0xF0):
+ *   P00–P03: outputs (config bits 0–3 = 0)
+ *   P04–P07: inputs  (config bits 4–7 = 1)
+ *   Wired:   P00→P04, P01→P05, P02→P06, P03→P07
+ *
+ * Port 1 (P10–P17, relay drivers) is configured as all-inputs during this
+ * test to prevent accidental relay activation.
+ *
+ * Test drives each output pattern into the lower nibble and verifies the
+ * upper nibble of the input register reflects the expected state.
+ * --------------------------------------------------------------------------- */
+static result_t test_gpio_p0(void)
+{
+    /* Probe — check for ACK and configure port directions */
+    uint8_t cfg0[2] = { TCA9555_CFG0, TCA9555_P0_CFG };
+    if (i2c_write_blocking(i2c1, TCA9555_ADDR, cfg0, 2, false) != 2) {
+        printf("[SELF-TEST] GPIO-0: no ACK at 0x%02X — not fitted\n", TCA9555_ADDR);
+        return RESULT_NONE;
+    }
+
+    /* Configure port 1 as all-inputs for safety (relay pins, not tested here) */
+    uint8_t cfg1[2] = { TCA9555_CFG1, TCA9555_P1_CFG_SAFE };
+    i2c_write_blocking(i2c1, TCA9555_ADDR, cfg1, 2, false);
+
+    /* Test patterns: drive lower nibble, expect upper nibble = lower << 4 */
+    static const uint8_t out_pat[] = { 0x00, 0x01, 0x02, 0x04, 0x08, 0x0F };
+    static const uint8_t exp_pat[] = { 0x00, 0x10, 0x20, 0x40, 0x80, 0xF0 };
+
+    for (size_t i = 0; i < sizeof(out_pat); i++) {
+        /* Write output latch */
+        uint8_t wr[2] = { TCA9555_OUT0, out_pat[i] };
+        if (i2c_write_blocking(i2c1, TCA9555_ADDR, wr, 2, false) != 2) {
+            printf("[SELF-TEST] GPIO-0: output write error\n");
+            return RESULT_FAIL;
+        }
+        sleep_ms(1);   /* allow output to propagate through wiring */
+
+        /* Read input port */
+        uint8_t reg = TCA9555_IN0, in_val = 0;
+        if (i2c_write_blocking(i2c1, TCA9555_ADDR, &reg, 1, true)  != 1 ||
+            i2c_read_blocking (i2c1, TCA9555_ADDR, &in_val, 1, false) != 1) {
+            printf("[SELF-TEST] GPIO-0: input read error\n");
+            return RESULT_FAIL;
+        }
+
+        uint8_t got = in_val & 0xF0;
+        printf("[SELF-TEST] GPIO-0: out=0x%02X  in=0x%02X  exp_hi=0x%02X  %s\n",
+               out_pat[i], in_val, exp_pat[i],
+               got == exp_pat[i] ? "OK" : "MISMATCH");
+
+        if (got != exp_pat[i]) return RESULT_FAIL;
+    }
+    return RESULT_PASS;
+}
+
+/* ---------------------------------------------------------------------------
  * Main
  * --------------------------------------------------------------------------- */
 int main(void)
@@ -427,63 +470,69 @@ int main(void)
     printf("[SELF-TEST] Starting\n");
 
     /* Stage 1 — OLED */
-    result_t oled_result = RESULT_FAIL;
+    result_t r;
     if (ssd1306_init()) {
-        oled_result = RESULT_PASS;
+        r = RESULT_PASS;
         printf("[SELF-TEST] OLED: PASS\n");
     } else {
         printf("[SELF-TEST] OLED: FAIL (no ACK at 0x%02X)\n", SSD1306_ADDR);
         gpio_init(25); gpio_set_dir(25, GPIO_OUT);
         while (true) { gpio_put(25, 1); sleep_ms(100); gpio_put(25, 0); sleep_ms(100); }
     }
+    record_result("OLED:    ", r);
 
     /* Stage 2 — EEPROM */
-    result_t eeprom_result = test_eeprom();
+    r = test_eeprom();
     printf("[SELF-TEST] EEPROM: %s\n",
-           eeprom_result == RESULT_PASS ? "PASS" :
-           eeprom_result == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+           r == RESULT_PASS ? "PASS" : r == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+    record_result("EEPROM:  ", r);
 
     /* Stage 3 — RS-485 hardware UART1 */
-    result_t rs485_hw_result = test_rs485_hw();
+    r = test_rs485_hw();
     printf("[SELF-TEST] RS485-H: %s\n",
-           rs485_hw_result == RESULT_PASS ? "PASS" :
-           rs485_hw_result == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+           r == RESULT_PASS ? "PASS" : r == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+    record_result("RS485-H: ", r);
 
     /* Stage 4 — RS-485 software UART3 */
-    result_t rs485_sw_result = test_rs485_sw();
+    r = test_rs485_sw();
     printf("[SELF-TEST] RS485-S: %s\n",
-           rs485_sw_result == RESULT_PASS ? "PASS" :
-           rs485_sw_result == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+           r == RESULT_PASS ? "PASS" : r == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+    record_result("RS485-S: ", r);
 
-    /* Stages 5 & 6 — RS-232 (both phases share one init) */
-    result_t rs232_hw_result, rs232_sw_result;
-    test_rs232(&rs232_hw_result, &rs232_sw_result);
+    /* Stages 5 & 6 — RS-232 */
+    result_t rs232_hw, rs232_sw;
+    test_rs232(&rs232_hw, &rs232_sw);
     printf("[SELF-TEST] RS232-H: %s\n",
-           rs232_hw_result == RESULT_PASS ? "PASS" :
-           rs232_hw_result == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+           rs232_hw == RESULT_PASS ? "PASS" : rs232_hw == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
     printf("[SELF-TEST] RS232-S: %s\n",
-           rs232_sw_result == RESULT_PASS ? "PASS" :
-           rs232_sw_result == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+           rs232_sw == RESULT_PASS ? "PASS" : rs232_sw == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+    record_result("RS232-H: ", rs232_hw);
+    record_result("RS232-S: ", rs232_sw);
 
-    /* Show results and loop */
-    draw_results(oled_result, eeprom_result,
-                 rs485_hw_result, rs485_sw_result,
-                 rs232_hw_result, rs232_sw_result);
+    /* Stage 7 — GPIO expander port 0 */
+    r = test_gpio_p0();
+    printf("[SELF-TEST] GPIO-0:  %s\n",
+           r == RESULT_PASS ? "PASS" : r == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+    record_result("GPIO-0:  ", r);
 
+    /* Show first screen and enter display loop */
+    draw_screen(0);
+
+    int screen    = 0;
+    int n_screens = (result_count + 6) / 7;   /* 7 results per screen */
     uint32_t loop = 0;
+
     while (true) {
         sleep_ms(5000);
-        draw_results(oled_result, eeprom_result,
-                     rs485_hw_result, rs485_sw_result,
-                     rs232_hw_result, rs232_sw_result);
-        printf("[SELF-TEST] loop=%lu  OLED:%s  EEPROM:%s  "
-               "RS485-H:%s  RS485-S:%s  RS232-H:%s  RS232-S:%s\n",
-               loop++,
-               oled_result    == RESULT_PASS ? "PASS" : "FAIL",
-               eeprom_result  == RESULT_PASS ? "PASS" : eeprom_result  == RESULT_FAIL ? "FAIL" : "NONE",
-               rs485_hw_result== RESULT_PASS ? "PASS" : rs485_hw_result== RESULT_FAIL ? "FAIL" : "NONE",
-               rs485_sw_result== RESULT_PASS ? "PASS" : rs485_sw_result== RESULT_FAIL ? "FAIL" : "NONE",
-               rs232_hw_result== RESULT_PASS ? "PASS" : rs232_hw_result== RESULT_FAIL ? "FAIL" : "NONE",
-               rs232_sw_result== RESULT_PASS ? "PASS" : rs232_sw_result== RESULT_FAIL ? "FAIL" : "NONE");
+        screen = (screen + 1) % n_screens;
+        draw_screen(screen * 7);
+
+        printf("[SELF-TEST] loop=%lu", loop++);
+        for (int i = 0; i < result_count; i++) {
+            printf("  %s%s", result_label[i],
+                   result_value[i] == RESULT_PASS ? "PASS" :
+                   result_value[i] == RESULT_FAIL ? "FAIL" : "NONE");
+        }
+        printf("\n");
     }
 }

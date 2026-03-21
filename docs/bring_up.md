@@ -81,14 +81,17 @@ Once the board is powered over USB the OLED shows a results screen within
 
 ```
     THL PWR CTL
-      Self Test
 OLED:    PASS
 EEPROM:  NONE
 RS485-H: NONE
 RS485-S: NONE
 RS232-H: NONE
 RS232-S: NONE
+GPIO-0:  NONE
 ```
+The subtitle row has been removed to accommodate all result rows on a single
+screen. When more than 7 results are present the display alternates between
+screens every 5 seconds.
 
 The display refreshes every 5 seconds to confirm the board is still running.
 
@@ -174,13 +177,13 @@ the RS-485 transceivers are not yet fitted so those rows show `NONE`:
 
 ```
     THL PWR CTL
-      Self Test
 OLED:    PASS
 EEPROM:  PASS
 RS485-H: NONE
 RS485-S: NONE
 RS232-H: NONE
 RS232-S: NONE
+GPIO-0:  NONE
 ```
 
 USB serial output shows each EEPROM write/read-back cycle:
@@ -280,13 +283,13 @@ cmake --build build --target self_test
 
 ```
     THL PWR CTL
-      Self Test
 OLED:    PASS
 EEPROM:  PASS
 RS485-H: PASS
 RS485-S: PASS
 RS232-H: NONE
 RS232-S: NONE
+GPIO-0:  NONE
 ```
 
 USB serial shows each byte of the loopback sequence for both channels:
@@ -413,13 +416,13 @@ cmake --build build --target self_test
 
 ```
     THL PWR CTL
-      Self Test
 OLED:    PASS
 EEPROM:  PASS
 RS485-H: PASS
 RS485-S: PASS
 RS232-H: PASS
 RS232-S: PASS
+GPIO-0:  NONE
 ```
 
 USB serial shows both phases:
@@ -456,6 +459,127 @@ USB serial shows both phases:
 - [ ] No hot components, no smell of burning.
 
 **Do not proceed to Stage 5 until all Stage 4 pass criteria are met.**
+
+---
+
+---
+
+## Stage 5 — GPIO Expander Port 0
+
+The **TCA9555PWR** is a 16-bit I2C GPIO expander on I2C1 (address 0x20,
+GP2/GP3). Port 0 pins are used for general I/O; Port 1 pins drive relays and
+are tested in the next stage.
+
+**Port 0 wiring for this stage:**
+
+| Output | Input | Wire |
+|--------|-------|------|
+| P00    | P04   | P00 → P04 |
+| P01    | P05   | P01 → P05 |
+| P02    | P06   | P02 → P06 |
+| P03    | P07   | P03 → P07 |
+
+The test configures P00–P03 as outputs and P04–P07 as inputs, then drives six
+output patterns and reads the input register to verify each wire is intact.
+Port 1 is configured as all-inputs during this test to prevent accidental
+relay activation.
+
+### Components to solder
+
+| Ref | Component | Notes |
+|-----|-----------|-------|
+| U?  | TCA9555PWR | I2C1, address 0x20, GP2/GP3 |
+| C?  | Bypass capacitor (100 nF) | As close to VCC pin as possible |
+
+### Before soldering — visual checks
+
+1. Confirm Stage 4 pass criteria were met before proceeding.
+2. Verify TCA9555PWR pin 1 orientation against PCB silkscreen.
+3. Confirm I2C address pins A0/A1/A2 are all tied to GND (gives address 0x20).
+
+### Soldering
+
+1. Solder the **bypass capacitor**.
+2. Solder the **TCA9555PWR**. Tack one corner, verify alignment, complete.
+   Inspect for bridges — TSSOP-24 has fine pitch.
+
+### Wiring
+
+After soldering, fit **four jumper wires** between the Port 0 test points:
+
+```
+P00 ──► P04
+P01 ──► P05
+P02 ──► P06
+P03 ──► P07
+```
+
+Confirm each wire is correctly placed before applying power. A crossed wire
+will produce a FAIL rather than a NONE.
+
+### Post-solder checks — before applying power
+
+1. **Power:** No short between VCC and GND on the TCA9555PWR.
+2. **I2C bus:** SDA (GP2) and SCL (GP3) still free of shorts — now carries
+   three devices (OLED 0x3C, EEPROM 0x50, GPIO expander 0x20).
+3. **Address pins:** Confirm A0/A1/A2 are at GND (measure voltage to GND).
+
+### Firmware
+
+Re-flash `self_test.uf2` — this stage requires firmware built after Stage 5
+was added.
+
+```bash
+cmake --build build --target self_test
+# Copy build/self_test.uf2 to the Pico via BOOTSEL
+```
+
+### Expected behaviour
+
+```
+    THL PWR CTL
+OLED:    PASS
+EEPROM:  PASS
+RS485-H: PASS
+RS485-S: PASS
+RS232-H: PASS
+RS232-S: PASS
+GPIO-0:  PASS
+```
+
+USB serial shows each output pattern and the corresponding input read-back:
+
+```
+[SELF-TEST] GPIO-0: out=0x00  in=0x00  exp_hi=0x00  OK
+[SELF-TEST] GPIO-0: out=0x01  in=0x11  exp_hi=0x10  OK
+[SELF-TEST] GPIO-0: out=0x02  in=0x22  exp_hi=0x20  OK
+[SELF-TEST] GPIO-0: out=0x04  in=0x44  exp_hi=0x40  OK
+[SELF-TEST] GPIO-0: out=0x08  in=0x88  exp_hi=0x80  OK
+[SELF-TEST] GPIO-0: out=0x0F  in=0xFF  exp_hi=0xF0  OK
+[SELF-TEST] GPIO-0:  PASS
+```
+
+*(The `in` value includes the output latch bits in the lower nibble, which
+the TCA9555 reflects back when reading the input register on output-configured
+pins. Only the upper nibble `exp_hi` is checked.)*
+
+### Fault diagnosis
+
+| Symptom | Likely cause | Action |
+|---------|--------------|--------|
+| `GPIO-0: NONE` | TCA9555PWR not ACK-ing | Check solder joints; confirm VCC is 3.3 V; verify A0/A1/A2 all at GND |
+| `GPIO-0: NONE` | Wrong I2C address | Confirm address pins — any pin high shifts address above 0x20 |
+| `GPIO-0: FAIL` on one bit | Single wire missing or broken | Check which bit mismatches in serial output; re-seat that jumper wire |
+| `GPIO-0: FAIL` on multiple bits | Direction mis-config or bus fault | Confirm no I2C bus contention; reflow IC joints |
+| Correct output but wrong input bit | Wires crossed | Verify P00→P04, P01→P05, P02→P06, P03→P07 |
+
+### Stage 5 pass criteria
+
+- [ ] OLED shows `GPIO-0: PASS`.
+- [ ] USB serial shows all six output patterns as `OK`.
+- [ ] No hot components, no smell of burning.
+
+**Do not proceed to Stage 6 until all Stage 5 pass criteria are met.**
 
 ---
 
