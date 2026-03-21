@@ -110,4 +110,91 @@ Once the board is powered over USB:
 
 ---
 
+---
+
+## Stage 2 — EEPROM
+
+### Components to solder
+
+| Ref | Component | Notes |
+|-----|-----------|-------|
+| U?  | W24C02 EEPROM | I2C1, address 0x50, GP2/GP3 |
+| C?  | Bypass capacitor (100 nF) | Place as close to EEPROM VCC pin as possible |
+
+### Before soldering — visual checks
+
+1. Confirm Stage 1 pass criteria were met before proceeding.
+2. Inspect the EEPROM and bypass capacitor footprints for lifted pads or
+   debris.
+3. Verify the EEPROM orientation marking against the PCB silkscreen.
+
+### Soldering
+
+1. Solder the **bypass capacitor** first — it is the smaller component and
+   easier to place before the EEPROM body is in the way.
+2. Solder the **W24C02 EEPROM**. Tack one corner pin, verify alignment, then
+   solder remaining pins. Inspect for bridges under magnification.
+
+### Post-solder checks — before applying power
+
+1. **Continuity — power:** Confirm no short between EEPROM VCC and GND.
+2. **I2C lines:** Confirm SDA (GP2) and SCL (GP3) remain un-shorted. The OLED
+   and EEPROM share the same I2C1 bus; both devices should now be visible on
+   it.
+3. **Bypass cap orientation:** If polarised, confirm correct polarity.
+
+### Firmware
+
+The same `self_test.uf2` binary is used for all stages. Re-flash if the
+binary on the board pre-dates Stage 2 support (i.e., was built before this
+stage was added).
+
+```bash
+cmake --build build --target self_test
+# Copy build/self_test.uf2 to the Pico via BOOTSEL
+```
+
+### Expected behaviour
+
+The OLED shows a results screen within 3 seconds of power-up:
+
+```
+    THL PWR CTL
+      Self Test
+
+OLED:    PASS
+EEPROM:  PASS
+```
+
+USB serial output shows each EEPROM write/read-back cycle:
+
+```
+[SELF-TEST] EEPROM: wrote 0xAA  read 0xAA  OK
+[SELF-TEST] EEPROM: wrote 0x55  read 0x55  OK
+[SELF-TEST] EEPROM: wrote 0xA5  read 0xA5  OK
+[SELF-TEST] EEPROM: PASS
+```
+
+The display refreshes every 5 seconds to confirm the board is still running.
+
+### Fault diagnosis
+
+| Symptom | Likely cause | Action |
+|---------|--------------|--------|
+| `EEPROM: NONE` on OLED | EEPROM not ACK-ing | Check solder joints on all EEPROM pins; confirm VCC is 3.3 V |
+| `EEPROM: NONE` on OLED | Wrong I2C address | Confirm A0/A1/A2 address pins are tied to GND (address = 0x50) |
+| `EEPROM: FAIL` on OLED | Write/read mismatch | Check SDA (GP2) and SCL (GP3) joints for cold joints or bridges |
+| `EEPROM: FAIL` on OLED | Bus contention | Confirm no other device is holding SDA/SCL low |
+| OLED shows `OLED: PASS` but `EEPROM: FAIL` | EEPROM data corruption | Reflow EEPROM joints; replace component if persists |
+
+### Stage 2 pass criteria
+
+- [ ] OLED displays `OLED: PASS` and `EEPROM: PASS` within 3 seconds of power-up.
+- [ ] USB serial shows all three write/read-back cycles as `OK`.
+- [ ] No hot components, no smell of burning.
+
+**Do not proceed to Stage 3 until all Stage 2 pass criteria are met.**
+
+---
+
 *Further stages will be added as components are verified and added to the build-up sequence.*
