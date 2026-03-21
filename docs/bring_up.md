@@ -76,19 +76,31 @@ cmake --build build --target self_test
 
 ### Expected behaviour
 
-Once the board is powered over USB:
+Once the board is powered over USB the OLED shows a results screen within
+3 seconds. At Stage 1 only the OLED is fitted; all other rows show `NONE`:
 
-- The OLED display illuminates and shows **"OLED Working"** centred on the
-  screen.
-- The message refreshes every **1 second**.
-- A matching debug line is printed over USB serial each second:
-  ```
-  [SELF-TEST] loop=0  OLED Working
-  [SELF-TEST] loop=1  OLED Working
-  ...
-  ```
-  To view the serial output on Linux: `minicom -b 115200 -D /dev/ttyACM0`
-  (device node may differ — check `dmesg` after plugging in).
+```
+    THL PWR CTL
+      Self Test
+
+OLED:    PASS
+EEPROM:  NONE
+RS485-H: NONE
+RS485-S: NONE
+```
+
+The display refreshes every 5 seconds to confirm the board is still running.
+
+USB serial output (view on Linux with `minicom -b 115200 -D /dev/ttyACM0`;
+device node may differ — check `dmesg` after plugging in):
+
+```
+[SELF-TEST] Starting
+[SELF-TEST] OLED: PASS
+[SELF-TEST] EEPROM: NONE (not fitted)
+[SELF-TEST] RS485-H: NONE (not fitted)
+[SELF-TEST] RS485-S: NONE (not fitted)
+```
 
 ### Fault diagnosis
 
@@ -102,8 +114,8 @@ Once the board is powered over USB:
 
 ### Stage 1 pass criteria
 
-- [ ] OLED displays **"OLED Working"** within 3 seconds of USB power being applied.
-- [ ] Message refreshes visibly every second.
+- [ ] OLED shows `OLED: PASS` within 3 seconds of USB power being applied.
+- [ ] Display refreshes every 5 seconds.
 - [ ] No hot components, no smell of burning.
 
 **Do not proceed to Stage 2 until all Stage 1 pass criteria are met.**
@@ -156,7 +168,8 @@ cmake --build build --target self_test
 
 ### Expected behaviour
 
-The OLED shows a results screen within 3 seconds of power-up:
+The OLED shows a results screen within 3 seconds of power-up. At Stage 2
+the RS-485 transceivers are not yet fitted so those rows show `NONE`:
 
 ```
     THL PWR CTL
@@ -164,6 +177,8 @@ The OLED shows a results screen within 3 seconds of power-up:
 
 OLED:    PASS
 EEPROM:  PASS
+RS485-H: NONE
+RS485-S: NONE
 ```
 
 USB serial output shows each EEPROM write/read-back cycle:
@@ -194,6 +209,118 @@ The display refreshes every 5 seconds to confirm the board is still running.
 - [ ] No hot components, no smell of burning.
 
 **Do not proceed to Stage 3 until all Stage 2 pass criteria are met.**
+
+---
+
+---
+
+## Stage 3 — RS-485 Transceivers
+
+Both RS-485 channels use the **ISL83488IBZ** full-duplex RS-485/RS-422
+transceiver. UART1 (hardware) uses GP4/GP5; UART3 (software bit-bang) uses
+GP14/GP15. Each transceiver has separate driver outputs (Y/Z) and receiver
+inputs (A/B). DE is permanently tied HIGH and RE is permanently tied LOW —
+no firmware direction control is needed.
+
+The loopback test wires Y/Z back to A/B on each channel so that every
+transmitted bit is immediately received back through the transceiver.
+
+### Components to solder
+
+| Ref | Component | Notes |
+|-----|-----------|-------|
+| U?  | ISL83488IBZ — UART1 channel | GP4 → DI, GP5 ← RO; DE tied HIGH, RE tied LOW |
+| U?  | ISL83488IBZ — UART3 channel | GP14 → DI, GP15 ← RO; DE tied HIGH, RE tied LOW |
+| C?  | Bypass capacitor ×2 (100 nF) | One per transceiver, as close to VCC as possible |
+| R?  | 120 Ω termination resistor ×2 | One per channel — between Y and Z, and between A and B |
+| J?  | Termination jumpers | Connect both jumpers to enable termination on each side |
+| J?  | Loopback wiring / headers | Wire Y to A and Z to B on each channel |
+
+### Before soldering — visual checks
+
+1. Confirm Stage 2 pass criteria were met before proceeding.
+2. Inspect ISL83488IBZ footprints and verify pin 1 orientation against PCB
+   silkscreen. Incorrect orientation will not damage the device at 3.3 V but
+   will cause the test to fail.
+3. Confirm DE and RE tie-off resistors/traces are present on the PCB. DE must
+   be pulled to VCC and RE must be pulled to GND for full-duplex operation.
+
+### Soldering
+
+1. Solder **bypass capacitors** first.
+2. Solder both **ISL83488IBZ** transceivers. Tack one corner pin per IC,
+   verify alignment, then complete. Inspect closely for bridges — this is an
+   SOIC package with fine pitch.
+3. Solder the **120 Ω termination resistors**.
+4. Connect the **termination jumpers** (both channels, both ends).
+
+### Post-solder checks — before applying power
+
+1. **DE and RE:** Confirm DE is pulled to VCC (≈3.3 V) and RE to GND on both
+   ICs. A misconnected DE or RE will cause NONE or FAIL in firmware.
+2. **Termination:** Confirm 120 Ω measures between Y and Z, and between A and
+   B, on each channel with the jumpers connected.
+3. **Loopback wiring:** Confirm Y is connected to A, and Z to B, on each
+   channel. Swapping Y/Z or A/B will cause a FAIL (inverted signal).
+4. **Power:** No short between VCC and GND on either IC.
+
+### Firmware
+
+Re-flash `self_test.uf2` — this stage requires the firmware built after
+Stage 3 was added.
+
+```bash
+cmake --build build --target self_test
+# Copy build/self_test.uf2 to the Pico via BOOTSEL
+```
+
+### Expected behaviour
+
+```
+    THL PWR CTL
+      Self Test
+
+OLED:    PASS
+EEPROM:  PASS
+RS485-H: PASS
+RS485-S: PASS
+```
+
+USB serial shows each byte of the loopback sequence for both channels:
+
+```
+[SELF-TEST] RS485-H: sent 0x52  recv 0x52  OK
+[SELF-TEST] RS485-H: sent 0x53  recv 0x53  OK
+[SELF-TEST] RS485-H: sent 0x34  recv 0x34  OK
+[SELF-TEST] RS485-H: sent 0x38  recv 0x38  OK
+[SELF-TEST] RS485-H: sent 0x35  recv 0x35  OK
+[SELF-TEST] RS485-H: PASS
+[SELF-TEST] RS485-S: byte 0x52 ('R')  OK
+[SELF-TEST] RS485-S: byte 0x53 ('S')  OK
+[SELF-TEST] RS485-S: byte 0x34 ('4')  OK
+[SELF-TEST] RS485-S: byte 0x38 ('8')  OK
+[SELF-TEST] RS485-S: byte 0x35 ('5')  OK
+[SELF-TEST] RS485-S: PASS
+```
+
+### Fault diagnosis
+
+| Symptom | Likely cause | Action |
+|---------|--------------|--------|
+| `RS485-H: NONE` | HW UART1 loopback open | Check Y→A and Z→B wiring on UART1 channel; confirm DE is high |
+| `RS485-S: NONE` | SW UART3 loopback open | Check Y→A and Z→B wiring on UART3 channel; confirm DE is high |
+| `RS485-H: FAIL` | Byte mismatch on UART1 | Check for Y/Z or A/B swap; inspect ISL83488IBZ solder joints on GP4/GP5 side |
+| `RS485-S: FAIL` | Bit mismatch on UART3 | Check GP14/GP15 ISL83488IBZ joints; confirm RE is tied LOW |
+| Either channel `FAIL`, inverted data | Y/Z or A/B polarity swapped | Swap the loopback wires (Y↔Z or A↔B) |
+| Correct bytes received but intermittent | Poor solder joint or marginal termination | Reflow joints; confirm 120 Ω termination on both sides |
+
+### Stage 3 pass criteria
+
+- [ ] OLED shows `RS485-H: PASS` and `RS485-S: PASS`.
+- [ ] USB serial shows all five bytes `OK` for both channels.
+- [ ] No hot components, no smell of burning.
+
+**Do not proceed to Stage 4 until all Stage 3 pass criteria are met.**
 
 ---
 
