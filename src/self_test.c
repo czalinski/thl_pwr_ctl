@@ -11,6 +11,8 @@
  * Stage 5 — RS-232 HW UART0 loop  (ST3232BDR,   GP0  TX / GP1  RX)
  * Stage 6 — RS-232 SW UART2 loop  (ST3232BDR,   GP6  TX / GP7  RX)
  * Stage 7 — GPIO expander P0 I/O  (TCA9555PWR,  I2C1 0x20, GP2/GP3)
+ * Stage 8 — ADC conversion check  (MCP3428,     I2C1 0x36, GP2/GP3)
+ * Stage 9 — DAC + ADC loopback    (MCP48FVB02T, SPI1 GP10/11/13)
  *
  * ---- Display layout ----
  * The display has 8 pages (rows). Page 0 is always the title "THL PWR CTL";
@@ -50,6 +52,42 @@
  * RS232-H reports the Phase H result (UART0 TX + UART2 RX path).
  * RS232-S reports the Phase S result (UART2 TX + UART0 RX path).
  *
+ * ---- MCP3428 ADC design note ----
+ * The MCP3428 is a 4-channel 16-bit delta-sigma ADC. The test selects
+ * continuous-conversion mode at 12-bit / 240 sps (config byte 0x8X) and
+ * cycles through all four channels. After each channel switch the firmware
+ * waits one conversion period (~5 ms) then reads 3 bytes: two data bytes
+ * followed by the configuration register. The /RDY bit (bit 7 of the config
+ * byte) must be clear, indicating a fresh conversion is available. Because the
+ * analog inputs are left unconnected, the actual codes are not checked — only
+ * that the device ACKs, accepts the config write, and reports a completed
+ * conversion on every channel.
+ *
+ * ---- MCP48FVB02T DAC + ADC loopback design note ----
+ * The MCP48FVB02T is a 2-channel 8-bit SPI DAC with a 3.3 V external Vref.
+ * Op-amp circuitry scales the 0–3.3 V output to 0–VUSER. With the VUSER
+ * jumper set to 5 V, DAC full scale (0xFF) drives the output to 5 V.
+ *
+ * Each DAC channel feeds two MCP3428 ADC inputs through a 10 MΩ / 180 kΩ
+ * voltage divider (anti-aliasing RC: 180 kΩ + 0.1 µF, f_c ≈ 8.8 Hz):
+ *   DAC channel A (address 0x00) → ADC CH1 and CH2
+ *   DAC channel B (address 0x01) → ADC CH3 and CH4
+ *
+ * SPI command frame (24 bits, MSB first):
+ *   bits [23:19] — 5-bit register address (0x00 = DAC0, 0x01 = DAC1)
+ *   bits [18:17] — command: 0b00 = write, 0b11 = read
+ *   bit  [16]    — error flag (0 for writes)
+ *   bits [15:8]  — data high byte (don't care for 8-bit DAC, send 0x00)
+ *   bits [7:0]   — 8-bit DAC value (0x00 = 0 %, 0xFF = 100 %)
+ *
+ * Byte 0 = (addr << 3) | 0x00   (cmd=0b00 occupies bits 2:1, err=0 in bit 0)
+ *
+ * Expected ADC reading at 100 % (5 V output):
+ *   Vout = 5 V × 180k / (10M + 180k) ≈ 88.4 mV → ~88 counts at 1 mV/LSB
+ *   Pass window: 80–96 counts (±10 %).
+ *   At 0 % the ADC must read ≤ 5 counts (noise floor).
+ *   RC settling time constant τ = 18 ms; firmware waits 100 ms (≈ 5τ).
+ *
  * RESULT_NONE — no response received; component not fitted or not connected.
  * RESULT_FAIL — response received but data mismatch; signal or wiring fault.
  */
@@ -59,6 +97,7 @@
 #include "pico/stdlib.h"
 #include "hardware/i2c.h"
 #include "hardware/uart.h"
+#include "hardware/spi.h"
 #include "ssd1306.h"
 
 /* ---------------------------------------------------------------------------
@@ -107,6 +146,34 @@
 #define TCA9555_P0_CFG   0xF0
 /* P10–P17 relay outputs — configure as inputs for safety during P0 test */
 #define TCA9555_P1_CFG_SAFE  0xFF
+
+/* MCP3428 4-channel ADC (I2C1, address 0x36) */
+#define MCP3428_ADDR     0x36
+#define MCP3428_CONV_MS  5       /* 240 sps → ~4.2 ms; 5 ms gives margin */
+/* Config byte: /RDY | C1 | C0 | /OC | S1 | S0 | G1 | G0
+ * /RDY=1 (triggers one-shot or has no effect in continuous), /OC=0 (continuous),
+ * S1:S0=00 (12-bit, 240 sps), G1:G0=00 (gain = 1×).
+ * Channel is selected by C1:C0 (bits 6–5). */
+#define MCP3428_CFG_BASE 0x80    /* continuous, 12-bit, 1×, ch1 */
+#define MCP3428_RDY_BIT  0x80    /* /RDY in read config byte: 0 = conversion ready */
+
+/* MCP48FVB02T 2-channel 8-bit SPI DAC (SPI1) */
+#define DAC_SPI_PORT     spi1
+#define DAC_SCK_PIN      10
+#define DAC_MOSI_PIN     11
+#define DAC_CS_PIN       13
+#define DAC_SPI_BAUD     1000000
+/* Byte 0 of the 24-bit frame: (addr << 3) | cmd<<1 | err
+ * cmd = 0b00 (write) → bit[1:0] of addr-shifted byte = 0x00 */
+#define DAC_CH0_ADDR     0x00   /* volatile DAC0 register */
+#define DAC_CH1_ADDR     0x01   /* volatile DAC1 register */
+
+/* ADC loopback thresholds — 10 MΩ / 180 kΩ divider, VUSER = 5 V, 12-bit gain-1×
+ * Vout = 5 V × 180k/(10M+180k) ≈ 88.4 mV → ~88 counts (1 mV/LSB) */
+#define ADC_EXPECT_FULL  88
+#define ADC_TOLERANCE     8     /* 10 % of 88 */
+#define ADC_NOISE_FLOOR   5     /* max counts acceptable at 0 V */
+#define DAC_SETTLE_MS   100     /* 5 × RC time constant (τ = 18 ms) */
 
 /* Test payload shared by all serial loopback tests */
 static const uint8_t SERIAL_TEST_MSG[] = { 'R', 'S', '2', '3', '2' };
@@ -460,6 +527,162 @@ static result_t test_gpio_p0(void)
 }
 
 /* ---------------------------------------------------------------------------
+ * Stage 8 — MCP3428 ADC, 4-channel conversion check
+ *
+ * Inputs are unconnected (floating); the test does not validate the ADC
+ * codes — only that the device ACKs, accepts a config write, and reports
+ * a completed conversion (/RDY = 0) for each of the four channels.
+ *
+ * Read format (12-bit mode): [data_MSB, data_LSB, config_byte]
+ * The upper 4 bits of data_MSB are sign-extended by the device, so casting
+ * the two data bytes directly to int16_t gives the correct signed value.
+ * --------------------------------------------------------------------------- */
+static result_t test_adc(void)
+{
+    /* Probe — attempt a read to check for ACK */
+    uint8_t buf[3];
+    if (i2c_read_blocking(i2c1, MCP3428_ADDR, buf, 3, false) != 3) {
+        printf("[SELF-TEST] ADC: no ACK at 0x%02X — not fitted\n", MCP3428_ADDR);
+        return RESULT_NONE;
+    }
+
+    for (int ch = 0; ch < 4; ch++) {
+        /* Select channel (C1:C0 in bits 6–5), continuous mode, 12-bit, 1× */
+        uint8_t cfg = (uint8_t)(MCP3428_CFG_BASE | ((uint8_t)ch << 5));
+        if (i2c_write_blocking(i2c1, MCP3428_ADDR, &cfg, 1, false) != 1) {
+            printf("[SELF-TEST] ADC: config write error ch%d\n", ch + 1);
+            return RESULT_FAIL;
+        }
+        sleep_ms(MCP3428_CONV_MS);
+
+        if (i2c_read_blocking(i2c1, MCP3428_ADDR, buf, 3, false) != 3) {
+            printf("[SELF-TEST] ADC: read error ch%d\n", ch + 1);
+            return RESULT_FAIL;
+        }
+
+        if (buf[2] & MCP3428_RDY_BIT) {
+            printf("[SELF-TEST] ADC: ch%d conversion not ready (cfg=0x%02X)\n",
+                   ch + 1, buf[2]);
+            return RESULT_FAIL;
+        }
+
+        int16_t raw = (int16_t)(((uint16_t)buf[0] << 8) | buf[1]);
+        printf("[SELF-TEST] ADC: ch%d raw=0x%04X (%d)  cfg=0x%02X  OK\n",
+               ch + 1, (uint16_t)raw, raw, buf[2]);
+    }
+    return RESULT_PASS;
+}
+
+/* ---------------------------------------------------------------------------
+ * Stage 9 helpers — SPI DAC write and MCP3428 single-channel read
+ * --------------------------------------------------------------------------- */
+static void dac_write_ch(uint8_t addr, uint8_t value)
+{
+    /* 24-bit frame: byte0 = addr<<3 (cmd=00, err=0), byte1 = 0x00, byte2 = value */
+    uint8_t buf[3] = { (uint8_t)(addr << 3), 0x00, value };
+    gpio_put(DAC_CS_PIN, 0);
+    spi_write_blocking(DAC_SPI_PORT, buf, 3);
+    gpio_put(DAC_CS_PIN, 1);
+}
+
+/* ch: 0–3 maps to MCP3428 CH1–CH4. Returns false on I2C error or timeout. */
+static bool adc_read_ch(int ch, int16_t *out)
+{
+    uint8_t cfg = (uint8_t)(MCP3428_CFG_BASE | ((uint8_t)ch << 5));
+    if (i2c_write_blocking(i2c1, MCP3428_ADDR, &cfg, 1, false) != 1)
+        return false;
+    sleep_ms(MCP3428_CONV_MS);
+    uint8_t buf[3];
+    if (i2c_read_blocking(i2c1, MCP3428_ADDR, buf, 3, false) != 3)
+        return false;
+    if (buf[2] & MCP3428_RDY_BIT)
+        return false;
+    *out = (int16_t)(((uint16_t)buf[0] << 8) | buf[1]);
+    return true;
+}
+
+/* ---------------------------------------------------------------------------
+ * Stage 9 — MCP48FVB02T DAC loopback through MCP3428 ADC
+ *
+ * Both DAC channels are driven to 0 % then 100 % in a single pass. The ADC
+ * is read after each transition (100 ms settling for the RC filter). Channel
+ * A uses ADC CH1+CH2; channel B uses ADC CH3+CH4.
+ *
+ * RESULT_NONE: 100 % reading ≤ noise floor on both ADC inputs — DAC or signal
+ *              path not present.
+ * RESULT_FAIL: 0 % reading above noise floor, or 100 % reading outside the
+ *              ±10 % window around the expected 88 counts.
+ * --------------------------------------------------------------------------- */
+static void test_dac(result_t *ch_a, result_t *ch_b)
+{
+    /* Initialise SPI1 */
+    spi_init(DAC_SPI_PORT, DAC_SPI_BAUD);
+    spi_set_format(DAC_SPI_PORT, 8, SPI_CPOL_0, SPI_CPHA_0, SPI_MSB_FIRST);
+    gpio_set_function(DAC_SCK_PIN,  GPIO_FUNC_SPI);
+    gpio_set_function(DAC_MOSI_PIN, GPIO_FUNC_SPI);
+    gpio_init(DAC_CS_PIN);
+    gpio_set_dir(DAC_CS_PIN, GPIO_OUT);
+    gpio_put(DAC_CS_PIN, 1);
+    sleep_us(100);
+
+    /* ---- 0 % ---- */
+    dac_write_ch(DAC_CH0_ADDR, 0x00);
+    dac_write_ch(DAC_CH1_ADDR, 0x00);
+    sleep_ms(DAC_SETTLE_MS);
+
+    int16_t z0 = 0, z1 = 0, z2 = 0, z3 = 0;
+    if (!adc_read_ch(0, &z0) || !adc_read_ch(1, &z1) ||
+        !adc_read_ch(2, &z2) || !adc_read_ch(3, &z3)) {
+        printf("[SELF-TEST] DAC: ADC read error at 0%%\n");
+        *ch_a = *ch_b = RESULT_FAIL;
+        return;
+    }
+    printf("[SELF-TEST] DAC:   0%%: ch1=%d ch2=%d ch3=%d ch4=%d  (floor<=%d)\n",
+           z0, z1, z2, z3, ADC_NOISE_FLOOR);
+
+    /* ---- 100 % ---- */
+    dac_write_ch(DAC_CH0_ADDR, 0xFF);
+    dac_write_ch(DAC_CH1_ADDR, 0xFF);
+    sleep_ms(DAC_SETTLE_MS);
+
+    int16_t f0 = 0, f1 = 0, f2 = 0, f3 = 0;
+    if (!adc_read_ch(0, &f0) || !adc_read_ch(1, &f1) ||
+        !adc_read_ch(2, &f2) || !adc_read_ch(3, &f3)) {
+        printf("[SELF-TEST] DAC: ADC read error at 100%%\n");
+        *ch_a = *ch_b = RESULT_FAIL;
+        return;
+    }
+    printf("[SELF-TEST] DAC: 100%%: ch1=%d ch2=%d ch3=%d ch4=%d  exp=%d+/-%d\n",
+           f0, f1, f2, f3, ADC_EXPECT_FULL, ADC_TOLERANCE);
+
+    /* Evaluate channel A (DAC0 → CH1, CH2) */
+    if (f0 <= ADC_NOISE_FLOOR && f1 <= ADC_NOISE_FLOOR) {
+        *ch_a = RESULT_NONE;
+    } else if (z0 <= ADC_NOISE_FLOOR && z1 <= ADC_NOISE_FLOOR &&
+               f0 >= ADC_EXPECT_FULL - ADC_TOLERANCE &&
+               f0 <= ADC_EXPECT_FULL + ADC_TOLERANCE &&
+               f1 >= ADC_EXPECT_FULL - ADC_TOLERANCE &&
+               f1 <= ADC_EXPECT_FULL + ADC_TOLERANCE) {
+        *ch_a = RESULT_PASS;
+    } else {
+        *ch_a = RESULT_FAIL;
+    }
+
+    /* Evaluate channel B (DAC1 → CH3, CH4) */
+    if (f2 <= ADC_NOISE_FLOOR && f3 <= ADC_NOISE_FLOOR) {
+        *ch_b = RESULT_NONE;
+    } else if (z2 <= ADC_NOISE_FLOOR && z3 <= ADC_NOISE_FLOOR &&
+               f2 >= ADC_EXPECT_FULL - ADC_TOLERANCE &&
+               f2 <= ADC_EXPECT_FULL + ADC_TOLERANCE &&
+               f3 >= ADC_EXPECT_FULL - ADC_TOLERANCE &&
+               f3 <= ADC_EXPECT_FULL + ADC_TOLERANCE) {
+        *ch_b = RESULT_PASS;
+    } else {
+        *ch_b = RESULT_FAIL;
+    }
+}
+
+/* ---------------------------------------------------------------------------
  * Main
  * --------------------------------------------------------------------------- */
 int main(void)
@@ -514,6 +737,22 @@ int main(void)
     printf("[SELF-TEST] GPIO-0:  %s\n",
            r == RESULT_PASS ? "PASS" : r == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
     record_result("GPIO-0:  ", r);
+
+    /* Stage 8 — MCP3428 ADC */
+    r = test_adc();
+    printf("[SELF-TEST] ADC:     %s\n",
+           r == RESULT_PASS ? "PASS" : r == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+    record_result("ADC:     ", r);
+
+    /* Stage 9 — MCP48FVB02T DAC loopback */
+    result_t dac_a, dac_b;
+    test_dac(&dac_a, &dac_b);
+    printf("[SELF-TEST] DAC-A:   %s\n",
+           dac_a == RESULT_PASS ? "PASS" : dac_a == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+    printf("[SELF-TEST] DAC-B:   %s\n",
+           dac_b == RESULT_PASS ? "PASS" : dac_b == RESULT_FAIL ? "FAIL" : "NONE (not fitted)");
+    record_result("DAC-A:   ", dac_a);
+    record_result("DAC-B:   ", dac_b);
 
     /* Show first screen and enter display loop */
     draw_screen(0);

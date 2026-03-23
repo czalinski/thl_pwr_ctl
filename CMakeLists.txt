@@ -110,6 +110,7 @@ target_link_libraries(self_test
     pico_stdlib
     hardware_i2c
     hardware_uart
+    hardware_spi
 )
 pico_enable_stdio_usb(self_test 1)
 pico_enable_stdio_uart(self_test 0)
