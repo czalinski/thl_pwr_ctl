@@ -138,3 +138,42 @@ target_link_libraries(thl_pwr_ctl
 pico_enable_stdio_usb(thl_pwr_ctl 1)
 pico_enable_stdio_uart(thl_pwr_ctl 0)
 pico_add_extra_outputs(thl_pwr_ctl)
+
+# ---------------------------------------------------------------------------
+# pwr_ctl_test — Single-channel power control subsystem test
+#   MCP3428 ADC comms check + GP27 enable toggle, results on SSD1306 OLED
+# ---------------------------------------------------------------------------
+add_executable(pwr_ctl_test
+    src/pwr_ctl_test.c
+)
+target_include_directories(pwr_ctl_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(pwr_ctl_test
+    ssd1306
+    pico_stdlib
+    hardware_i2c
+)
+pico_enable_stdio_usb(pwr_ctl_test 1)
+pico_enable_stdio_uart(pwr_ctl_test 0)
+pico_add_extra_outputs(pwr_ctl_test)
+
+# ---------------------------------------------------------------------------
+# comms_test — I2C and SPI device communication test (OLED, EEPROM, GPIO exp,
+#              ADC pair, DAC)
+# ---------------------------------------------------------------------------
+add_executable(comms_test
+    src/comms_test.c
+)
+target_include_directories(comms_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(comms_test
+    ssd1306
+    pico_stdlib
+    hardware_i2c
+    hardware_spi
+)
+pico_enable_stdio_usb(comms_test 1)
+pico_enable_stdio_uart(comms_test 0)
+pico_add_extra_outputs(comms_test)

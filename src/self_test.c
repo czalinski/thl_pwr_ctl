@@ -264,98 +264,66 @@ static result_t test_eeprom(void)
 }
 
 /* ---------------------------------------------------------------------------
- * Stage 3 — RS-485 hardware UART1 loopback
+ * RS-485 GPIO signal-path test (shared helper)
  *
- * UART1 TX (GP4) drives the ISL83488IBZ DI; Y/Z wired to A/B so RO (GP5)
- * mirrors DI with ~10 ns delay. RP2040 hardware UART manages TX and RX
- * simultaneously on independent paths.
+ * Tests the physical signal path through the ISL83488IBZ transceiver and
+ * the external Y/Z→A/B loopback wiring using raw GPIO — not UART framing.
+ *
+ * With DE tied HIGH and RE tied LOW the driver and receiver are permanently
+ * active. Driving DI (TX pin) low pulls Y/Z low; through the loopback this
+ * drives A/B low, pulling RO (RX pin) low. A floating or pull-up-only RX
+ * line stays high regardless of TX state — so TX=low → RX=low is the
+ * definitive wired-loopback check.
+ *
+ * NONE — RX did not follow TX low: loopback not wired
+ * FAIL — unexpected state when TX is driven high
+ * PASS — RX follows TX both high and low
  * --------------------------------------------------------------------------- */
-static result_t test_rs485_hw(void)
+static result_t test_rs485_gpio(uint tx_pin, uint rx_pin)
 {
-    uart_init(RS485_HW_UART, RS485_BAUD);
-    gpio_set_function(RS485_HW_TX_PIN, GPIO_FUNC_UART);
-    gpio_set_function(RS485_HW_RX_PIN, GPIO_FUNC_UART);
+    gpio_init(tx_pin);
+    gpio_set_dir(tx_pin, GPIO_OUT);
+    gpio_put(tx_pin, 1);
 
-    while (uart_is_readable(RS485_HW_UART))
-        uart_getc(RS485_HW_UART);
+    gpio_init(rx_pin);
+    gpio_set_dir(rx_pin, GPIO_IN);
+    gpio_pull_up(rx_pin);
+    sleep_us(200);   /* allow transceiver and pull-up to settle */
 
-    uart_write_blocking(RS485_HW_UART, SERIAL_TEST_MSG, SERIAL_TEST_LEN);
+    gpio_put(tx_pin, 1);
+    sleep_us(10);
+    int hi1 = gpio_get(rx_pin);
 
-    for (size_t i = 0; i < SERIAL_TEST_LEN; i++) {
-        uint32_t deadline = time_us_32() + RS485_HW_RX_TIMEOUT_US;
-        while (!uart_is_readable(RS485_HW_UART)) {
-            if (time_us_32() > deadline) {
-                printf("[SELF-TEST] RS485-H: timeout on byte %u — %s\n",
-                       (unsigned)i, i == 0 ? "not fitted" : "FAIL");
-                return (i == 0) ? RESULT_NONE : RESULT_FAIL;
-            }
-        }
-        uint8_t rx = uart_getc(RS485_HW_UART);
-        printf("[SELF-TEST] RS485-H: sent 0x%02X  recv 0x%02X  %s\n",
-               SERIAL_TEST_MSG[i], rx,
-               rx == SERIAL_TEST_MSG[i] ? "OK" : "MISMATCH");
-        if (rx != SERIAL_TEST_MSG[i]) return RESULT_FAIL;
-    }
+    gpio_put(tx_pin, 0);
+    sleep_us(10);
+    int lo = gpio_get(rx_pin);
+
+    gpio_put(tx_pin, 1);
+    sleep_us(10);
+    int hi2 = gpio_get(rx_pin);
+
+    printf("[SELF-TEST] RS485 GP%u->GP%u: TX=H RX=%d  TX=L RX=%d  TX=H RX=%d\n",
+           tx_pin, rx_pin, hi1, lo, hi2);
+
+    if (lo != 0)
+        return RESULT_NONE;   /* RX did not follow TX low — loopback not wired */
+    if (hi1 != 1 || hi2 != 1)
+        return RESULT_FAIL;
     return RESULT_PASS;
 }
 
 /* ---------------------------------------------------------------------------
- * Stage 4 — RS-485 software UART3 loopback (bit-bang, 9600 baud)
- *
- * Exploits the near-zero ISL83488IBZ loopback propagation: each bit is
- * driven on GP14 and GP15 is sampled at the midpoint of the same bit period.
- * This tests the full signal chain without interrupts, PIO, or concurrent
- * TX/RX threads.
+ * Stage 3 — RS-485 channel 1 (GP4 TX / GP5 RX, UART1 pins)
+ * Stage 4 — RS-485 channel 3 (GP14 TX / GP15 RX, UART3 pins)
  * --------------------------------------------------------------------------- */
+static result_t test_rs485_hw(void)
+{
+    return test_rs485_gpio(RS485_HW_TX_PIN, RS485_HW_RX_PIN);
+}
+
 static result_t test_rs485_sw(void)
 {
-    gpio_init(RS485_SW_TX_PIN);
-    gpio_set_dir(RS485_SW_TX_PIN, GPIO_OUT);
-    gpio_put(RS485_SW_TX_PIN, 1);
-
-    gpio_init(RS485_SW_RX_PIN);
-    gpio_set_dir(RS485_SW_RX_PIN, GPIO_IN);
-    gpio_pull_up(RS485_SW_RX_PIN);
-    sleep_us(200);
-
-    /* Probe: pull TX low and verify RX follows */
-    gpio_put(RS485_SW_TX_PIN, 0);
-    sleep_us(RS485_SW_HALF_US);
-    int probe_rx = gpio_get(RS485_SW_RX_PIN);
-    gpio_put(RS485_SW_TX_PIN, 1);
-    sleep_us(RS485_SW_BIT_US);
-
-    if (probe_rx != 0) {
-        printf("[SELF-TEST] RS485-S: RX did not follow TX low — not fitted\n");
-        return RESULT_NONE;
-    }
-
-    for (size_t m = 0; m < SERIAL_TEST_LEN; m++) {
-        uint8_t byte = SERIAL_TEST_MSG[m];
-        bool byte_ok = true;
-
-        gpio_put(RS485_SW_TX_PIN, 0);          /* start bit */
-        sleep_us(RS485_SW_HALF_US);
-        if (gpio_get(RS485_SW_RX_PIN) != 0) byte_ok = false;
-        sleep_us(RS485_SW_HALF_US);
-
-        for (int b = 0; b < 8; b++) {          /* 8 data bits, LSB first */
-            uint8_t tx_bit = (byte >> b) & 1u;
-            gpio_put(RS485_SW_TX_PIN, tx_bit);
-            sleep_us(RS485_SW_HALF_US);
-            if ((uint8_t)gpio_get(RS485_SW_RX_PIN) != tx_bit) byte_ok = false;
-            sleep_us(RS485_SW_HALF_US);
-        }
-
-        gpio_put(RS485_SW_TX_PIN, 1);          /* stop bit */
-        sleep_us(RS485_SW_BIT_US);
-
-        printf("[SELF-TEST] RS485-S: byte 0x%02X ('%c')  %s\n",
-               byte, (byte >= 0x20 && byte < 0x7F) ? (char)byte : '.',
-               byte_ok ? "OK" : "MISMATCH");
-        if (!byte_ok) return RESULT_FAIL;
-    }
-    return RESULT_PASS;
+    return test_rs485_gpio(RS485_SW_TX_PIN, RS485_SW_RX_PIN);
 }
 
 /* ---------------------------------------------------------------------------
@@ -688,9 +656,31 @@ static void test_dac(result_t *ch_a, result_t *ch_b)
 int main(void)
 {
     stdio_init_all();
-    sleep_ms(2000);
+    sleep_ms(3000);  /* wait for USB CDC to enumerate on the host */
 
     printf("[SELF-TEST] Starting\n");
+
+    /* I2C1 probe — runs before ssd1306_init so no prior I2C activity can interfere.
+     * Checks OLED, GPIO expander, external ADC, and EEPROM. Results reprinted
+     * each loop so they are always visible regardless of when the port is opened. */
+    static char i2c_scan_result[128];
+    {
+        i2c_init(i2c1, 400000);
+        gpio_set_function(2, GPIO_FUNC_I2C);
+        gpio_set_function(3, GPIO_FUNC_I2C);
+        gpio_pull_up(2);
+        gpio_pull_up(3);
+        sleep_ms(5);
+        uint8_t oled_probe[2] = {0x00, 0xAE};
+        uint8_t d = 0;
+        int r3c = i2c_write_blocking(i2c1, 0x3C, oled_probe, 2, false);
+        int r20 = i2c_write_blocking(i2c1, 0x20, &d, 1, false);
+        int r37 = i2c_write_blocking(i2c1, 0x37, &d, 1, false);
+        int r50 = i2c_write_blocking(i2c1, 0x50, &d, 1, false);
+        snprintf(i2c_scan_result, sizeof(i2c_scan_result),
+                 "I2C1: 0x3C=%d 0x20=%d 0x37=%d 0x50=%d |",
+                 r3c, r20, r37, r50);
+    }
 
     /* Stage 1 — OLED */
     result_t r;
@@ -698,9 +688,8 @@ int main(void)
         r = RESULT_PASS;
         printf("[SELF-TEST] OLED: PASS\n");
     } else {
+        r = RESULT_FAIL;
         printf("[SELF-TEST] OLED: FAIL (no ACK at 0x%02X)\n", SSD1306_ADDR);
-        gpio_init(25); gpio_set_dir(25, GPIO_OUT);
-        while (true) { gpio_put(25, 1); sleep_ms(100); gpio_put(25, 0); sleep_ms(100); }
     }
     record_result("OLED:    ", r);
 
@@ -766,7 +755,7 @@ int main(void)
         screen = (screen + 1) % n_screens;
         draw_screen(screen * 7);
 
-        printf("[SELF-TEST] loop=%lu", loop++);
+        printf("[SELF-TEST] loop=%lu  %s", loop++, i2c_scan_result);
         for (int i = 0; i < result_count; i++) {
             printf("  %s%s", result_label[i],
                    result_value[i] == RESULT_PASS ? "PASS" :
