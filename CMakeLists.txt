@@ -179,6 +179,27 @@ pico_enable_stdio_uart(comms_test 0)
 pico_add_extra_outputs(comms_test)
 
 # ---------------------------------------------------------------------------
+# dac_test — MCP4912T dual 10-bit DAC SPI PoC test
+#   Sweeps channel A then B from 0–10 V (after 3× op-amp), 1 V/step, 2 s/step
+#   OLED status on I2C0; SPI1 for DAC
+# ---------------------------------------------------------------------------
+add_executable(dac_test
+    src/dac_test.c
+)
+target_include_directories(dac_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(dac_test
+    ssd1306
+    pico_stdlib
+    hardware_i2c
+    hardware_spi
+)
+pico_enable_stdio_usb(dac_test 1)
+pico_enable_stdio_uart(dac_test 0)
+pico_add_extra_outputs(dac_test)
+
+# ---------------------------------------------------------------------------
 # relay_gpio_test — Relay driver and GPIO subsystem PoC test
 #   TCAL9539 GPIO expander + TLC59108 LED driver + GP22 direct relay
 #   Auto-detects I2C bus (I2C0/I2C1) at boot via physical jumpers
