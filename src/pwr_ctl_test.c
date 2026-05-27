@@ -82,6 +82,7 @@
 #define EN_PIN          27      /* GP27: active-high; starts LOW (output disabled) */
 
 #define TOGGLE_MS       5000    /* EN toggle period */
+#define ADC_BURST_N     8       /* back-to-back samples per noise check (~40 ms/ch) */
 
 typedef enum { RESULT_PASS, RESULT_FAIL, RESULT_NONE } result_t;
 
@@ -134,6 +135,31 @@ static result_t adc_read_ch(uint8_t ch, int16_t *out_mv)
 }
 
 /* ---------------------------------------------------------------------------
+ * MCP3428 — burst read
+ *
+ * Takes ADC_BURST_N back-to-back samples of channel ch and returns the
+ * min, max, and last value.  Stops early and returns the error code if any
+ * individual read fails.
+ * --------------------------------------------------------------------------- */
+static result_t adc_burst(uint8_t ch,
+                           int16_t *out_min, int16_t *out_max, int16_t *out_last)
+{
+    int16_t mn =  32767, mx = -32768, last = 0;
+    for (uint8_t i = 0; i < ADC_BURST_N; i++) {
+        int16_t v;
+        result_t r = adc_read_ch(ch, &v);
+        if (r != RESULT_PASS) return r;
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+        last = v;
+    }
+    *out_min  = mn;
+    *out_max  = mx;
+    *out_last = last;
+    return RESULT_PASS;
+}
+
+/* ---------------------------------------------------------------------------
  * Display
  * --------------------------------------------------------------------------- */
 static uint8_t center_col(const char *s)
@@ -145,7 +171,9 @@ static uint8_t center_col(const char *s)
 static void draw_screen(result_t adc_status,
                         bool en_on,
                         bool volt_valid, int16_t volt_mv,
+                        int16_t volt_min, int16_t volt_max,
                         bool curr_valid, int16_t curr_mv,
+                        int16_t curr_min, int16_t curr_max,
                         uint32_t cycle)
 {
     static const char *adc_tag[] = { "PASS", "FAIL", "NONE" };
@@ -183,6 +211,20 @@ static void draw_screen(result_t adc_status,
     snprintf(line, sizeof(line), "Cycle: %lu", (unsigned long)cycle);
     ssd1306_draw_string(4, 5, line);
 
+    /* Page 6 — voltage burst span (max−min), 0 = no variation detected */
+    if (volt_valid)
+        snprintf(line, sizeof(line), "Vspn:%+d..%+d", volt_min, volt_max);
+    else
+        snprintf(line, sizeof(line), "Vspn: ------");
+    ssd1306_draw_string(4, 6, line);
+
+    /* Page 7 — current burst span */
+    if (curr_valid)
+        snprintf(line, sizeof(line), "Ispn:%+d..%+d", curr_min, curr_max);
+    else
+        snprintf(line, sizeof(line), "Ispn: ------");
+    ssd1306_draw_string(4, 7, line);
+
     ssd1306_flush();
 }
 
@@ -215,8 +257,8 @@ int main(void)
      * Bare 3-byte read first to verify the device ACKs its address (NONE if
      * not). Then read CH1 and CH3; FAIL if either conversion stalls. */
     result_t adc_status;
-    int16_t  volt_mv   = 0;
-    int16_t  curr_mv   = 0;
+    int16_t  volt_mv = 0, volt_min = 0, volt_max = 0;
+    int16_t  curr_mv = 0, curr_min = 0, curr_max = 0;
     bool     volt_valid = false;
     bool     curr_valid = false;
 
@@ -226,15 +268,18 @@ int main(void)
             adc_status = RESULT_NONE;
             printf("[PWRTEST] ADC: NONE (no ACK at 0x%02X)\n", ADDR_ADC);
         } else {
-            result_t rv = adc_read_ch(ADC_CH_VOLT, &volt_mv);
-            result_t ri = adc_read_ch(ADC_CH_CURR, &curr_mv);
+            result_t rv = adc_burst(ADC_CH_VOLT, &volt_min, &volt_max, &volt_mv);
+            result_t ri = adc_burst(ADC_CH_CURR, &curr_min, &curr_max, &curr_mv);
             volt_valid = (rv == RESULT_PASS);
             curr_valid = (ri == RESULT_PASS);
 
             if (rv == RESULT_PASS && ri == RESULT_PASS) {
                 adc_status = RESULT_PASS;
-                printf("[PWRTEST] ADC: PASS  CH1=%+d mV  CH3=%+d mV\n",
-                       volt_mv, curr_mv);
+                printf("[PWRTEST] ADC: PASS"
+                       "  CH1=%+d mV [%+d..%+d span=%d]"
+                       "  CH3=%+d mV [%+d..%+d span=%d]\n",
+                       volt_mv, volt_min, volt_max, volt_max - volt_min,
+                       curr_mv, curr_min, curr_max, curr_max - curr_min);
             } else {
                 adc_status = RESULT_FAIL;
                 printf("[PWRTEST] ADC: FAIL  CH1=%s  CH3=%s\n",
@@ -249,10 +294,10 @@ int main(void)
     /* --- Initial display (cycle=0 = pre-toggle state) --- */
     if (oled_ok) {
         draw_screen(adc_status, en_on,
-                    volt_valid, volt_mv,
-                    curr_valid, curr_mv,
+                    volt_valid, volt_mv, volt_min, volt_max,
+                    curr_valid, curr_mv, curr_min, curr_max,
                     0);
-        i2c1_reinit();   /* recover after flush before next ADC read */
+        i2c1_reinit();
     }
 
     /* --- Main loop: toggle EN every 5 s, read ADC, update display ---
@@ -275,14 +320,12 @@ int main(void)
         printf("[PWRTEST] cycle=%lu  EN=%s\n",
                (unsigned long)cycle, en_on ? "ON" : "OFF");
 
-        /* Read ADC channels */
-        result_t rv = adc_read_ch(ADC_CH_VOLT, &volt_mv);
-        result_t ri = adc_read_ch(ADC_CH_CURR, &curr_mv);
+        /* Read ADC channels — burst of ADC_BURST_N samples each */
+        result_t rv = adc_burst(ADC_CH_VOLT, &volt_min, &volt_max, &volt_mv);
+        result_t ri = adc_burst(ADC_CH_CURR, &curr_min, &curr_max, &curr_mv);
         volt_valid = (rv == RESULT_PASS);
         curr_valid = (ri == RESULT_PASS);
 
-        /* Determine overall ADC status for this cycle.
-         * NONE takes priority: if the config write is NACKed the device is gone. */
         if (rv == RESULT_NONE) {
             adc_status = RESULT_NONE;
         } else if (rv == RESULT_PASS && ri == RESULT_PASS) {
@@ -291,17 +334,24 @@ int main(void)
             adc_status = RESULT_FAIL;
         }
 
-        printf("[PWRTEST] ADC: %s  V=%+d mV  I=%+d mV\n",
+        printf("[PWRTEST] ADC: %s"
+               "  V=%+d [%+d..%+d spn=%d]"
+               "  I=%+d [%+d..%+d spn=%d]\n",
                adc_status == RESULT_PASS ? "PASS" :
                adc_status == RESULT_FAIL ? "FAIL" : "NONE",
-               volt_valid ? (int)volt_mv : 0,
-               curr_valid ? (int)curr_mv : 0);
+               volt_valid ? (int)volt_mv  : 0,
+               volt_valid ? (int)volt_min : 0,
+               volt_valid ? (int)volt_max : 0,
+               volt_valid ? volt_max - volt_min : 0,
+               curr_valid ? (int)curr_mv  : 0,
+               curr_valid ? (int)curr_min : 0,
+               curr_valid ? (int)curr_max : 0,
+               curr_valid ? curr_max - curr_min : 0);
 
-        /* Update display, then re-init I2C1 for next iteration */
         if (oled_ok) {
             draw_screen(adc_status, en_on,
-                        volt_valid, volt_mv,
-                        curr_valid, curr_mv,
+                        volt_valid, volt_mv, volt_min, volt_max,
+                        curr_valid, curr_mv, curr_min, curr_max,
                         cycle);
             i2c1_reinit();
         }
