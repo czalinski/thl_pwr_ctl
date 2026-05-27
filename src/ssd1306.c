@@ -5,6 +5,23 @@
 #include "hardware/gpio.h"
 
 // ---------------------------------------------------------------------------
+// Runtime bus state (defaults from compile-time defines; override via
+// ssd1306_set_bus() before calling ssd1306_init()).
+// ---------------------------------------------------------------------------
+
+/* NULL = not overridden; ssd1306_init() falls back to compile-time defaults */
+static i2c_inst_t *s_bus = NULL;
+static uint        s_sda = SSD1306_SDA_PIN;
+static uint        s_scl = SSD1306_SCL_PIN;
+
+void ssd1306_set_bus(i2c_inst_t *inst, uint sda_pin, uint scl_pin)
+{
+    s_bus = inst;
+    s_sda = sda_pin;
+    s_scl = scl_pin;
+}
+
+// ---------------------------------------------------------------------------
 // Internal helpers
 // ---------------------------------------------------------------------------
 
@@ -13,7 +30,7 @@ static uint8_t framebuf[SSD1306_PAGES * SSD1306_WIDTH];  /* 1024 bytes */
 static void write_cmd(uint8_t cmd)
 {
     uint8_t buf[2] = { 0x00, cmd };   /* Co=0, D/C=0 */
-    i2c_write_blocking(SSD1306_I2C_INST, SSD1306_ADDR, buf, 2, false);
+    i2c_write_blocking(s_bus, SSD1306_ADDR, buf, 2, false);
 }
 
 // ---------------------------------------------------------------------------
@@ -128,17 +145,18 @@ static const uint8_t font5x7[][SSD1306_FONT_W] = {
 
 bool ssd1306_init(void)
 {
-    i2c_init(SSD1306_I2C_INST, SSD1306_I2C_BAUD);
-    gpio_set_function(SSD1306_SDA_PIN, GPIO_FUNC_I2C);
-    gpio_set_function(SSD1306_SCL_PIN, GPIO_FUNC_I2C);
-    gpio_pull_up(SSD1306_SDA_PIN);
-    gpio_pull_up(SSD1306_SCL_PIN);
+    if (!s_bus) s_bus = SSD1306_I2C_INST;   /* apply default if not overridden */
+    i2c_init(s_bus, SSD1306_I2C_BAUD);
+    gpio_set_function(s_sda, GPIO_FUNC_I2C);
+    gpio_set_function(s_scl, GPIO_FUNC_I2C);
+    gpio_pull_up(s_sda);
+    gpio_pull_up(s_scl);
 
     sleep_ms(10);   /* allow display to power up */
 
     // Probe: send display-off command and check for ACK
     uint8_t probe[2] = { 0x00, 0xAE };
-    int ret = i2c_write_blocking(SSD1306_I2C_INST, SSD1306_ADDR, probe, 2, false);
+    int ret = i2c_write_blocking(s_bus, SSD1306_ADDR, probe, 2, false);
     if (ret == PICO_ERROR_GENERIC) {
         return false;   /* no ACK — display not present */
     }
@@ -163,7 +181,7 @@ bool ssd1306_init(void)
         0xA6,           /* normal (non-inverted) display */
         0xAF,           /* display on */
     };
-    i2c_write_blocking(SSD1306_I2C_INST, SSD1306_ADDR,
+    i2c_write_blocking(s_bus, SSD1306_ADDR,
                        init_seq, sizeof(init_seq), false);
 
     ssd1306_clear();
@@ -202,15 +220,15 @@ void ssd1306_flush(void)
 {
     // Set column address: 0 to 127
     uint8_t col_cmd[] = { 0x00, 0x21, 0, SSD1306_WIDTH - 1 };
-    i2c_write_blocking(SSD1306_I2C_INST, SSD1306_ADDR, col_cmd, sizeof(col_cmd), false);
+    i2c_write_blocking(s_bus, SSD1306_ADDR, col_cmd, sizeof(col_cmd), false);
 
     // Set page address: 0 to 7
     uint8_t page_cmd[] = { 0x00, 0x22, 0, SSD1306_PAGES - 1 };
-    i2c_write_blocking(SSD1306_I2C_INST, SSD1306_ADDR, page_cmd, sizeof(page_cmd), false);
+    i2c_write_blocking(s_bus, SSD1306_ADDR, page_cmd, sizeof(page_cmd), false);
 
     // Send framebuffer: control byte 0x40 (data mode) + 1024 pixel bytes
     static uint8_t txbuf[1 + SSD1306_PAGES * SSD1306_WIDTH];
     txbuf[0] = 0x40;
     memcpy(txbuf + 1, framebuf, sizeof(framebuf));
-    i2c_write_blocking(SSD1306_I2C_INST, SSD1306_ADDR, txbuf, sizeof(txbuf), false);
+    i2c_write_blocking(s_bus, SSD1306_ADDR, txbuf, sizeof(txbuf), false);
 }

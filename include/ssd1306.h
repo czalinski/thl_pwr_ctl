@@ -38,6 +38,13 @@
 // ---------------------------------------------------------------------------
 
 /**
+ * Override the I2C bus and pins at runtime before calling ssd1306_init().
+ * Allows bus selection based on board jumper state without recompiling.
+ * If not called, defaults from the compile-time defines are used.
+ */
+void ssd1306_set_bus(i2c_inst_t *inst, uint sda_pin, uint scl_pin);
+
+/**
  * Initialise I2C bus and send the SSD1306 startup sequence.
  * Must be called once before any other ssd1306_* function.
  * Returns true on success, false if the display did not ACK.

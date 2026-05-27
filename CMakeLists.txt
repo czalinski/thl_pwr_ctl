@@ -177,3 +177,23 @@ target_link_libraries(comms_test
 pico_enable_stdio_usb(comms_test 1)
 pico_enable_stdio_uart(comms_test 0)
 pico_add_extra_outputs(comms_test)
+
+# ---------------------------------------------------------------------------
+# relay_gpio_test — Relay driver and GPIO subsystem PoC test
+#   TCAL9539 GPIO expander + TLC59108 LED driver + GP22 direct relay
+#   Auto-detects I2C bus (I2C0/I2C1) at boot via physical jumpers
+# ---------------------------------------------------------------------------
+add_executable(relay_gpio_test
+    src/relay_gpio_test.c
+)
+target_include_directories(relay_gpio_test PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(relay_gpio_test
+    ssd1306
+    pico_stdlib
+    hardware_i2c
+)
+pico_enable_stdio_usb(relay_gpio_test 1)
+pico_enable_stdio_uart(relay_gpio_test 0)
+pico_add_extra_outputs(relay_gpio_test)
