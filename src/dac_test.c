@@ -51,6 +51,8 @@
 
 #define I2C0_SDA_PIN    8
 #define I2C0_SCL_PIN    9
+#define I2C1_SDA_PIN    2
+#define I2C1_SCL_PIN    3
 #define I2C_BAUD        400000u
 
 #define SPI1_SCK_PIN    10
@@ -58,6 +60,8 @@
 #define SPI1_MISO_PIN   12
 #define SPI1_CS_PIN     13
 #define SPI_BAUD        10000000u   /* 10 MHz — within MCP4912T 20 MHz max */
+
+#define ADDR_OLED       0x3C
 
 /* ---------------------------------------------------------------------------
  * Analog signal-chain constants
@@ -75,16 +79,20 @@
 #define STEP_MS         2000
 
 /* ---------------------------------------------------------------------------
- * I2C bus recovery — call after every ssd1306_flush() / ssd1306_init()
+ * Runtime bus state — selected at boot by probing for OLED
  * --------------------------------------------------------------------------- */
 
+static i2c_inst_t *s_bus;
+static uint        s_sda, s_scl;
+
+/* Recover I2C peripheral after ssd1306_flush() leaves it in a bad state */
 static void bus_reinit(void)
 {
-    i2c_init(i2c0, I2C_BAUD);
-    gpio_set_function(I2C0_SDA_PIN, GPIO_FUNC_I2C);
-    gpio_set_function(I2C0_SCL_PIN, GPIO_FUNC_I2C);
-    gpio_pull_up(I2C0_SDA_PIN);
-    gpio_pull_up(I2C0_SCL_PIN);
+    i2c_init(s_bus, I2C_BAUD);
+    gpio_set_function(s_sda, GPIO_FUNC_I2C);
+    gpio_set_function(s_scl, GPIO_FUNC_I2C);
+    gpio_pull_up(s_sda);
+    gpio_pull_up(s_scl);
 }
 
 /* ---------------------------------------------------------------------------
@@ -119,7 +127,7 @@ static uint16_t voltage_to_code(float v_amp)
  * --------------------------------------------------------------------------- */
 
 static void draw_screen(bool spi_ok, uint8_t active_ch, uint8_t step,
-                        uint16_t code, uint32_t cycle)
+                        uint16_t code, uint32_t cycle, const char *bus_name)
 {
     char     line[22];
     float    v_amp = code * V_AMP_SCALE;
@@ -129,25 +137,28 @@ static void draw_screen(bool spi_ok, uint8_t active_ch, uint8_t step,
 
     ssd1306_draw_string(10, 0, "ANALOG OUT TEST");
 
+    snprintf(line, sizeof(line), "Bus:%-12s", bus_name);
+    ssd1306_draw_string(0, 1, line);
+
     snprintf(line, sizeof(line), "SPI:%-4s  Cyc:%5lu",
              spi_ok ? "OK" : "FAIL", (unsigned long)cycle);
-    ssd1306_draw_string(0, 1, line);
+    ssd1306_draw_string(0, 2, line);
 
     snprintf(line, sizeof(line), "Chan: %c   Step:%2u/10",
              active_ch ? 'B' : 'A', step);
-    ssd1306_draw_string(0, 2, line);
-
-    snprintf(line, sizeof(line), "Target: %2u.0V amp", step);
     ssd1306_draw_string(0, 3, line);
 
-    snprintf(line, sizeof(line), "DAC code:   %4u", code);
+    snprintf(line, sizeof(line), "Target: %2u.0V amp", step);
     ssd1306_draw_string(0, 4, line);
 
-    snprintf(line, sizeof(line), "V_dac:  %6.3fV", v_dac);
+    snprintf(line, sizeof(line), "DAC code:   %4u", code);
     ssd1306_draw_string(0, 5, line);
 
-    snprintf(line, sizeof(line), "V_amp:  %6.3fV", v_amp);
+    snprintf(line, sizeof(line), "V_dac:  %6.3fV", v_dac);
     ssd1306_draw_string(0, 6, line);
+
+    snprintf(line, sizeof(line), "V_amp:  %6.3fV", v_amp);
+    ssd1306_draw_string(0, 7, line);
 
     ssd1306_flush();
 }
@@ -162,11 +173,58 @@ int main(void)
     sleep_ms(2000);
     printf("[DAC] Starting\n");
 
-    /* ---- OLED on I2C0 ----
-     * ssd1306_init() initialises the I2C bus internally, then calls
-     * ssd1306_flush() which leaves the RP2040 I2C peripheral in a bad state.
-     * bus_reinit() restores it before any further I2C access. */
-    ssd1306_set_bus(i2c0, I2C0_SDA_PIN, I2C0_SCL_PIN);
+    /* ---- Bus detection ----
+     * Probe OLED on I2C0 first; fall back to I2C1.
+     * Physical jumpers on the board select which bus all I2C devices share. */
+    s_bus = NULL;
+    const char *bus_name = "NONE";
+
+    i2c_init(i2c0, I2C_BAUD);
+    gpio_set_function(I2C0_SDA_PIN, GPIO_FUNC_I2C);
+    gpio_set_function(I2C0_SCL_PIN, GPIO_FUNC_I2C);
+    gpio_pull_up(I2C0_SDA_PIN);
+    gpio_pull_up(I2C0_SCL_PIN);
+    sleep_ms(5);
+    {
+        uint8_t d = 0;
+        if (i2c_write_blocking(i2c0, ADDR_OLED, &d, 1, false) >= 0) {
+            s_bus = i2c0; s_sda = I2C0_SDA_PIN; s_scl = I2C0_SCL_PIN;
+            bus_name = "I2C0 (GP8/9)";
+        }
+    }
+
+    if (!s_bus) {
+        i2c_init(i2c1, I2C_BAUD);
+        gpio_set_function(I2C1_SDA_PIN, GPIO_FUNC_I2C);
+        gpio_set_function(I2C1_SCL_PIN, GPIO_FUNC_I2C);
+        gpio_pull_up(I2C1_SDA_PIN);
+        gpio_pull_up(I2C1_SCL_PIN);
+        sleep_ms(5);
+        uint8_t d = 0;
+        if (i2c_write_blocking(i2c1, ADDR_OLED, &d, 1, false) >= 0) {
+            s_bus = i2c1; s_sda = I2C1_SDA_PIN; s_scl = I2C1_SCL_PIN;
+            bus_name = "I2C1 (GP2/3)";
+        }
+    }
+
+    printf("[DAC] Bus: %s\n", bus_name);
+
+    if (!s_bus) {
+        printf("[DAC] ERROR: OLED not found on either bus — check jumpers\n");
+        gpio_init(25); gpio_set_dir(25, GPIO_OUT);
+        while (true) { gpio_put(25, 1); sleep_ms(200); gpio_put(25, 0); sleep_ms(200); }
+    }
+
+    /* ---- I2C scan on detected bus ---- */
+    printf("[DAC] I2C scan on %s:\n", bus_name);
+    for (uint8_t a = 0x08; a < 0x78; a++) {
+        uint8_t d = 0;
+        if (i2c_write_blocking(s_bus, a, &d, 1, false) >= 0)
+            printf("  found 0x%02X\n", a);
+    }
+
+    /* ---- OLED init ---- */
+    ssd1306_set_bus(s_bus, s_sda, s_scl);
     bool oled_ok = ssd1306_init();
     bus_reinit();
     printf("[DAC] OLED: %s\n", oled_ok ? "PASS" : "FAIL");
@@ -209,7 +267,7 @@ int main(void)
                    code * V_AMP_SCALE);
 
             if (oled_ok) {
-                draw_screen(spi_ok, 0, step, code, cycle);
+                draw_screen(spi_ok, 0, step, code, cycle, bus_name);
                 bus_reinit();
             }
 
@@ -231,7 +289,7 @@ int main(void)
                    code * V_AMP_SCALE);
 
             if (oled_ok) {
-                draw_screen(spi_ok, 1, step, code, cycle);
+                draw_screen(spi_ok, 1, step, code, cycle, bus_name);
                 bus_reinit();
             }
 
