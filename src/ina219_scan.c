@@ -16,8 +16,14 @@
  *   SCL SCL  0x4B     SDA  SCL  0x4F
  *
  * Output key:
- *   FOUND — device ACKed the probe write (present on bus)
- *   NONE  — no ACK (device not fitted / address not strapped)
+ *   FOUND  — device ACKed; config register read and checked against default
+ *   NONE   — no ACK (device not fitted / address not strapped)
+ *
+ * INA219 config register (0x00) power-on default: 0x399F
+ *   [15:13] BRNG/PG = 0b001  (32V bus range, ±320 mV shunt)
+ *   [12:11] BADC   = 0b11    (12-bit, 532 µs)
+ *   [7:3]   SADC   = 0b11    (12-bit, 532 µs)
+ *   [2:0]   MODE   = 0b111   (continuous shunt+bus)
  */
 
 #include <stdio.h>
@@ -30,8 +36,21 @@
 #define I2C1_SCL_PIN    3
 #define I2C_BAUD        400000
 
-#define INA219_ADDR_MIN 0x40
-#define INA219_ADDR_MAX 0x4F
+#define INA219_ADDR_MIN   0x40
+#define INA219_ADDR_MAX   0x4F
+#define INA219_REG_CONFIG 0x00
+#define INA219_CONFIG_DEFAULT 0x399F
+
+/* Read a 16-bit big-endian register; returns false on I2C error */
+static bool ina219_read_reg(i2c_inst_t *bus, uint8_t addr,
+                             uint8_t reg, uint16_t *val)
+{
+    if (i2c_write_blocking(bus, addr, &reg, 1, true) != 1) return false;
+    uint8_t buf[2];
+    if (i2c_read_blocking(bus, addr, buf, 2, false) != 2) return false;
+    *val = ((uint16_t)buf[0] << 8) | buf[1];
+    return true;
+}
 
 static void scan_bus(i2c_inst_t *bus, const char *name)
 {
@@ -42,8 +61,18 @@ static void scan_bus(i2c_inst_t *bus, const char *name)
     for (uint8_t addr = INA219_ADDR_MIN; addr <= INA219_ADDR_MAX; addr++) {
         uint8_t d = 0;
         bool ack = (i2c_write_blocking(bus, addr, &d, 1, false) >= 0);
-        printf("  0x%02X  %s\n", addr, ack ? "FOUND" : "NONE");
-        if (ack) found++;
+        if (!ack) {
+            printf("  0x%02X  NONE\n", addr);
+            continue;
+        }
+        found++;
+        uint16_t cfg;
+        if (!ina219_read_reg(bus, addr, INA219_REG_CONFIG, &cfg)) {
+            printf("  0x%02X  FOUND  config=READ_ERR\n", addr);
+        } else {
+            printf("  0x%02X  FOUND  config=0x%04X  %s\n", addr, cfg,
+                   cfg == INA219_CONFIG_DEFAULT ? "(default — OK)" : "(non-default)");
+        }
     }
 
     printf("[INA219_SCAN] %s: %d device(s) found in range\n", name, found);
