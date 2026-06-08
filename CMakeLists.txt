@@ -200,6 +200,23 @@ pico_enable_stdio_uart(dac_test 0)
 pico_add_extra_outputs(dac_test)
 
 # ---------------------------------------------------------------------------
+# ina219_scan — INA219 I2C address scan (0x40–0x4F on both buses)
+# ---------------------------------------------------------------------------
+add_executable(ina219_scan
+    src/ina219_scan.c
+)
+target_include_directories(ina219_scan PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+target_link_libraries(ina219_scan
+    pico_stdlib
+    hardware_i2c
+)
+pico_enable_stdio_usb(ina219_scan 1)
+pico_enable_stdio_uart(ina219_scan 0)
+pico_add_extra_outputs(ina219_scan)
+
+# ---------------------------------------------------------------------------
 # relay_gpio_test — Relay driver and GPIO subsystem PoC test
 #   TCAL9539 GPIO expander + TLC59108 LED driver + GP22 direct relay
 #   Auto-detects I2C bus (I2C0/I2C1) at boot via physical jumpers
